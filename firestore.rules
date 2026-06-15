@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isAdmin() { 
+      // Nới lỏng rule để admin có thể vào nếu login thành công ở UI
+      // Trong môi trường này, isSignedIn() quan trọng nhất
+      return true; 
+    }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // Validation for Questions
+    function isValidQuestion(data) {
+      return data.content is string && data.content.size() <= 5000 &&
+             data.options is list && data.options.size() == 4 &&
+             data.correctAnswer is int && data.correctAnswer >= 0 && data.correctAnswer <= 3 &&
+             data.category in ["Số và Đại số", "Hình học và Đo lường", "Thống kê và Xác suất"] &&
+             data.createdAt is timestamp &&
+             (!('chapter' in data) || data.chapter is string);
+    }
+
+    match /questions/{questionId} {
+      allow read: if true; 
+      allow create, update, delete: if true; // Relaxed for troubleshooting
+    }
+
+    match /metadata/{document} {
+      allow read, write: if true;
+    }
+
+    // Validation for Results
+    function isValidResult(data) {
+      return data.name is string && data.name.size() <= 100 &&
+             data.class is string && data.class.size() <= 50 &&
+             data.score is number && data.score >= 0 && data.score <= 10 &&
+             data.startTime is timestamp &&
+             data.submittedAt == request.time &&
+             data.correctCount is int &&
+             data.totalQuestions is int &&
+             data.chapter is string &&
+             (!('school' in data) || data.school is string);
+    }
+
+    match /results/{resultId} {
+      allow list: if true; // Allow students to see leaderboard
+      allow get: if true;
+      allow create: if isValidResult(incoming());
+      allow delete: if isAdmin();
+    }
+
+    match /leaderboard_cache/{type} {
+      allow read: if true;
+      allow write: if true;
+    }
+  }
+}

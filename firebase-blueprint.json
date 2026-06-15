@@ -1,0 +1,49 @@
+{
+  "entities": {
+    "Question": {
+      "title": "Question",
+      "description": "A math test question",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "content": { "type": "string", "description": "Question content with LaTeX supported" },
+        "options": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Four options for the multiple choice question"
+        },
+        "correctAnswer": { "type": "integer", "description": "Index of the correct answer (0-3)" },
+        "category": { 
+          "type": "string", 
+          "enum": ["Số và Đại số", "Hình học và Đo lường", "Thống kê và Xác suất"] 
+        },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["content", "options", "correctAnswer", "category", "createdAt"]
+    },
+    "Result": {
+      "title": "Student Result",
+      "description": "Result of a student's quiz session",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "class": { "type": "string" },
+        "score": { "type": "number" },
+        "startTime": { "type": "string", "format": "date-time" },
+        "submittedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "class", "score", "startTime", "submittedAt"]
+    }
+  },
+  "firestore": {
+    "questions": {
+      "schema": "Question",
+      "description": "Collection of math questions"
+    },
+    "results": {
+      "schema": "Result",
+      "description": "Collection of student quiz results"
+    }
+  }
+}

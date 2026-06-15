@@ -1,0 +1,8 @@
+{
+  "name": "LUYỆN THI THPT THEO CHƯƠNG",
+  "description": "Hệ thống luyện thi trắc nghiệm vào lớp 10 theo cấu trúc SGD Quảng Trị",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

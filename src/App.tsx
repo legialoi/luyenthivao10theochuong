@@ -114,13 +114,13 @@ export default function App() {
                   </div>
                   <h3 className="text-lg font-black mb-1 text-slate-800">Luyện Tập Nhanh</h3>
                   <p className="text-slate-500 mb-4 leading-relaxed text-[11px] font-medium max-w-xs">
-                    Thử sức nhẹ nhàng với 10 câu hỏi ngẫu nhiên lập tức mà không cần khai báo danh tính.
+                    Thử sức nhẹ nhàng với 16 câu hỏi ngẫu nhiên lập tức mà không cần khai báo danh tính.
                   </p>
 
                   {/* Menu thả xuống chọn chương học */}
                   <div className="w-full mt-1 mb-4 select-none">
                     <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1.5 text-center">
-                      Chọn chương học luyện tập (10 câu)
+                      Chọn chương học luyện tập (16 câu)
                     </label>
                     <div className="relative max-w-xs mx-auto">
                       <select

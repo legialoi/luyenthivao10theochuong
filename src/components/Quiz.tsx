@@ -77,19 +77,19 @@ export default function Quiz({
       }
 
       if (isPractice) {
-        // Mode Quick Practice: Lấy ngẫu nhiên đúng 10 câu hỏi từ metadata
+        // Mode Quick Practice: Lấy ngẫu nhiên đúng 16 câu hỏi từ metadata
         let selectedIds: string[] = [];
         if (allQsMetaData.length > 0) {
           const filteredMeta = chap && chap !== 'all'
             ? allQsMetaData.filter(q => q.chapter?.trim() === chap.trim())
             : allQsMetaData;
           
-          selectedIds = shuffle(filteredMeta.map(q => q.id)).slice(0, 10);
+          selectedIds = shuffle(filteredMeta.map(q => q.id)).slice(0, 16);
         }
 
         let practiceQs: Question[] = [];
         if (selectedIds.length > 0) {
-          // Lấy đúng 10 câu hỏi chi tiết qua một câu truy vấn duy nhất hoặc chia chunks vì 'in' tối đa 10 phần tử
+          // Lấy đúng 16 câu hỏi chi tiết qua một câu truy vấn duy nhất hoặc chia chunks vì 'in' tối đa 10 phần tử
           const chunks = [];
           for(let i = 0; i < selectedIds.length; i += 10) {
               chunks.push(selectedIds.slice(i, i + 10));
@@ -106,9 +106,9 @@ export default function Quiz({
           }
         }
 
-        // Fallback: Nếu không có metadata/cache, tải trực tiếp bằng query theo chương (nếu chap specified) hoặc limit 40 chọn 10 câu
+        // Fallback: Nếu không có metadata/cache, tải trực tiếp bằng query theo chương (nếu chap specified) hoặc limit 40 chọn 16 câu
         if (practiceQs.length === 0) {
-          console.log("Fallback: Tải ngẫu nhiên 10 câu từ questions...");
+          console.log("Fallback: Tải ngẫu nhiên 16 câu từ questions...");
           try {
             let snapshot;
             if (chap && chap !== 'all') {
@@ -117,7 +117,7 @@ export default function Quiz({
               snapshot = await getDocs(query(collection(db, 'questions'), limit(40)));
             }
             const allFetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question));
-            practiceQs = shuffle(allFetched).slice(0, 10);
+            practiceQs = shuffle(allFetched).slice(0, 16);
           } catch (e) {
             handleFirestoreError(e, OperationType.GET, 'questions');
           }
@@ -367,7 +367,7 @@ export default function Quiz({
         class: '9',
         school: 'Luyện tập nhanh'
       });
-      setSelectedChapter(quickPracticeChapter && quickPracticeChapter !== 'all' ? quickPracticeChapter : 'Tự luyện ngẫu nhiên (10 câu)');
+      setSelectedChapter(quickPracticeChapter && quickPracticeChapter !== 'all' ? quickPracticeChapter : 'Tự luyện ngẫu nhiên (16 câu)');
       
       const startPractice = async () => {
         const success = await fetchAndRandomize(quickPracticeChapter, true);
@@ -445,7 +445,7 @@ export default function Quiz({
             {isQuickPractice ? 'Đang chuẩn bị luyện tập nhanh...' : 'Đang khởi tạo đề thi mới...'}
           </p>
           <p className="text-sm text-slate-400 mt-2 font-bold text-center">
-            {isQuickPractice ? 'Hệ thống đang chọn 10 câu hỏi ngẫu nhiên cho bạn.' : 'Hệ thống đang chuẩn bị 16 câu hỏi chất lượng cao cho bạn.'}
+            {isQuickPractice ? 'Hệ thống đang chọn 16 câu hỏi ngẫu nhiên cho bạn.' : 'Hệ thống đang chuẩn bị 16 câu hỏi chất lượng cao cho bạn.'}
           </p>
           {selectedChapter && (
             <div className="mt-4 px-4 py-2 bg-blue-50 border border-blue-100 rounded-xl text-xs font-bold text-blue-600 max-w-sm text-center truncate shadow-sm">
@@ -795,7 +795,7 @@ export default function Quiz({
         </h2>
         <p className="text-[10px] md:text-base text-slate-400 mb-6 md:mb-8 font-bold px-4 tracking-tight">
           {isQuickPractice 
-            ? 'Tuyệt vời! Bạn vừa hoàn thành bài luyện tập nhanh 10 câu hỏi.'
+            ? 'Tuyệt vời! Bạn vừa hoàn thành bài luyện tập nhanh 16 câu hỏi.'
             : <span>Chúc mừng <span className="text-blue-600 uppercase">{studentInfo.name}</span> đã hoàn thành.</span>}
         </p>
         
@@ -816,7 +816,7 @@ export default function Quiz({
         </div>
 
         <div className="bg-slate-50 p-3 md:p-5 rounded-lg md:rounded-xl border border-slate-100 mb-6 md:mb-8 inline-flex items-center gap-2 md:gap-4 mx-4">
-           <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${correctCount >= (isQuickPractice ? 5 : 8) ? 'bg-green-500' : 'bg-orange-500'}`}></div>
+           <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${score >= 5.0 ? 'bg-green-500' : 'bg-orange-500'}`}></div>
            <span className="text-[9px] md:text-sm font-black text-slate-600 uppercase tracking-widest leading-none">
              Đúng: <span className="text-slate-900">{correctCount}</span> / {questions.length} câu
            </span>

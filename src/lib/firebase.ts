@@ -27,7 +27,7 @@ export const PART_CHAPTERS: Record<string, string[]> = {
     'Chương I. PHƯƠNG TRÌNH VÀ HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN',
     'Chương II. PHƯƠNG TRÌNH VÀ BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN',
     'Chương III. CĂN BẬC HAI VÀ CĂN BẬC BA',
-    'Chương VI. HÀM SỐ $y = ax^2$ ($a \\neq 0$). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN'
+    'Chương VI. HÀM SỐ y = ax² (a ≠ 0). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN'
   ],
   'Hình học và Đo lường': [
     'Chương IV. HỆ THỨC LƯỢNG TRONG TAM GIÁC VUÔNG',

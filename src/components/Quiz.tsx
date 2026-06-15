@@ -185,7 +185,43 @@ export default function Quiz({
         // Trộn ngẫu nhiên câu hỏi của chương
         finalQuestions = shuffle(chapQsDetail).slice(0, 16);
       } else {
-        // Mode B: standard mock exam trích 8 chương, mỗi chương có đúng 2 câu (Tối ưu hóa lượt đọc hoàn hảo)
+        // Mode B: standard mock exam phân bổ đúng tỷ lệ theo chương học (Tổng cộng 16 câu)
+        const chapterQuotas: Record<string, number> = {
+          'Chương I. PHƯƠNG TRÌNH VÀ HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN': 2,
+          'Chương II. PHƯƠNG TRÌNH VÀ BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN': 2,
+          'Chương III. CĂN BẬC HAI VÀ CĂN BẬC BA': 2,
+          'Chương VI. HÀM SỐ $y = ax^2$ ($a \\neq 0$). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN': 2,
+          'Chương IV. HỆ THỨC LƯỢNG TRONG TAM GIÁC VUÔNG': 1,
+          'Chương X. MỘT SỐ HÌNH KHỐI TRONG THỰC TIỄN': 1,
+          'Chương V. ĐƯỜNG TRÒN': 2,
+          'Chương IX. ĐƯỜNG TRÒN NGOẠI TIẾP VÀ ĐƯỜNG TRÒN NỘI TIẾP': 2,
+          'Chương VII. TẦN SỐ VÀ TẦN SỐ TƯƠNG ĐỐI': 1,
+          'Chương VIII. XÁC SUẤT CỦA BIẾN CỐ TRONG MỘT SỐ MÔ HÌNH XÁC SUẤT ĐƠN GIẢN': 1
+        };
+
+        const getNormalizedKey = (chName: string): string | null => {
+          if (!chName) return null;
+          const clean = chName.trim().toUpperCase()
+            .replace(/\s+/g, ' ')
+            .replace(/\$/g, '')
+            .replace(/\\NEQ/g, '≠')
+            .replace(/\\NOT=/g, '≠')
+            .replace(/≠/g, '!=');
+          
+          for (const key of Object.keys(chapterQuotas)) {
+            const keyClean = key.trim().toUpperCase()
+              .replace(/\s+/g, ' ')
+              .replace(/\$/g, '')
+              .replace(/\\NEQ/g, '≠')
+              .replace(/\\NOT=/g, '≠')
+              .replace(/≠/g, '!=');
+            if (clean === keyClean) {
+              return key;
+            }
+          }
+          return null;
+        };
+
         let selectedIds: string[] = [];
         
         if (allQsMetaData.length > 0) {
@@ -194,33 +230,24 @@ export default function Quiz({
           allQsMetaData.forEach(q => {
             const chName = q.chapter ? q.chapter.trim() : '';
             if (chName) {
-              if (!questionsByChapter[chName]) {
-                questionsByChapter[chName] = [];
+              const matchedKey = getNormalizedKey(chName);
+              if (matchedKey) {
+                if (!questionsByChapter[matchedKey]) {
+                  questionsByChapter[matchedKey] = [];
+                }
+                questionsByChapter[matchedKey].push(q);
               }
-              questionsByChapter[chName].push(q);
             }
           });
 
-          // Danh sách toàn bộ chương học được cấu hình trong hệ thống
-          const systemChapters = Object.values(PART_CHAPTERS).flat();
-          const uniqueChapters = Array.from(new Set([...systemChapters, ...Object.keys(questionsByChapter)]));
-          const availableChapters = uniqueChapters.filter(ch => questionsByChapter[ch] && questionsByChapter[ch].length > 0);
-
-          // Chọn tối đa 8 chương học bất kỳ để trích đề
-          let chosenChapters: string[] = [];
-          if (availableChapters.length >= 8) {
-            chosenChapters = shuffle(availableChapters).slice(0, 8);
-          } else {
-            chosenChapters = [...availableChapters];
-          }
-
           const usedIds = new Set<string>();
 
-          // Trích tối đa 2 câu hỏi từ mỗi chương đã chọn
-          chosenChapters.forEach(ch => {
-            const chQs = shuffle(questionsByChapter[ch]);
-            const chosenFromCh = chQs.slice(0, 2);
-            chosenFromCh.forEach(q => {
+          // Chọn theo đúng quota của từng chương
+          Object.keys(chapterQuotas).forEach(ch => {
+            const quota = chapterQuotas[ch];
+            const chQs = shuffle(questionsByChapter[ch] || []);
+            const chosen = chQs.slice(0, quota);
+            chosen.forEach(q => {
               if (q.id) {
                 selectedIds.push(q.id);
                 usedIds.add(q.id);
@@ -276,31 +303,25 @@ export default function Quiz({
           allQs.forEach(q => {
             const chName = q.chapter ? q.chapter.trim() : '';
             if (chName) {
-              if (!questionsByChapter[chName]) {
-                questionsByChapter[chName] = [];
+              const matchedKey = getNormalizedKey(chName);
+              if (matchedKey) {
+                if (!questionsByChapter[matchedKey]) {
+                  questionsByChapter[matchedKey] = [];
+                }
+                questionsByChapter[matchedKey].push(q);
               }
-              questionsByChapter[chName].push(q);
             }
           });
-
-          const systemChapters = Object.values(PART_CHAPTERS).flat();
-          const uniqueChapters = Array.from(new Set([...systemChapters, ...Object.keys(questionsByChapter)]));
-          const availableChapters = uniqueChapters.filter(ch => questionsByChapter[ch] && questionsByChapter[ch].length > 0);
-
-          let chosenChapters: string[] = [];
-          if (availableChapters.length >= 8) {
-            chosenChapters = shuffle(availableChapters).slice(0, 8);
-          } else {
-            chosenChapters = [...availableChapters];
-          }
 
           const selectedQs: Question[] = [];
           const usedIds = new Set<string>();
 
-          chosenChapters.forEach(ch => {
-            const chQs = shuffle(questionsByChapter[ch]);
-            const chosenFromCh = chQs.slice(0, 2);
-            chosenFromCh.forEach(q => {
+          // Chọn theo đúng quota
+          Object.keys(chapterQuotas).forEach(ch => {
+            const quota = chapterQuotas[ch];
+            const chQs = shuffle(questionsByChapter[ch] || []);
+            const chosen = chQs.slice(0, quota);
+            chosen.forEach(q => {
               if (q.id) {
                 selectedQs.push(q);
                 usedIds.add(q.id);
@@ -781,21 +802,21 @@ export default function Quiz({
         <div className="mb-6 md:mb-10">
            <div className="bg-blue-600 p-5 md:p-10 rounded-[1.5rem] md:rounded-[2.5rem] shadow-2xl shadow-blue-200 text-white inline-block min-w-[180px] md:min-w-[280px]">
                <div className="text-[9px] md:text-[11px] text-blue-100 font-black uppercase tracking-[0.2em] mb-2 md:mb-4 leading-none">
-                 {isQuickPractice ? 'Số câu đúng' : 'Điểm số của bạn'}
+                 Điểm số của bạn
                </div>
                <div className="flex items-center justify-center gap-1 md:gap-2">
                   <span className="text-4xl md:text-8xl font-black tracking-tighter">
-                    {isQuickPractice ? correctCount : score.toFixed(1)}
+                    {score.toFixed(1)}
                   </span>
                   <span className="text-xl md:text-4xl font-bold text-blue-300">
-                    / {questions.length}
+                    / 10
                   </span>
                </div>
            </div>
         </div>
 
         <div className="bg-slate-50 p-3 md:p-5 rounded-lg md:rounded-xl border border-slate-100 mb-6 md:mb-8 inline-flex items-center gap-2 md:gap-4 mx-4">
-           <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${correctCount >= (isQuickPractice ? 3 : 8) ? 'bg-green-500' : 'bg-orange-500'}`}></div>
+           <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${correctCount >= (isQuickPractice ? 5 : 8) ? 'bg-green-500' : 'bg-orange-500'}`}></div>
            <span className="text-[9px] md:text-sm font-black text-slate-600 uppercase tracking-widest leading-none">
              Đúng: <span className="text-slate-900">{correctCount}</span> / {questions.length} câu
            </span>

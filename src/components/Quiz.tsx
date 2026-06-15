@@ -190,7 +190,7 @@ export default function Quiz({
           'Chương I. PHƯƠNG TRÌNH VÀ HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN': 2,
           'Chương II. PHƯƠNG TRÌNH VÀ BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN': 2,
           'Chương III. CĂN BẬC HAI VÀ CĂN BẬC BA': 2,
-          'Chương VI. HÀM SỐ $y = ax^2$ ($a \\neq 0$). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN': 2,
+          'Chương VI. HÀM SỐ y = ax² (a ≠ 0). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN': 2,
           'Chương IV. HỆ THỨC LƯỢNG TRONG TAM GIÁC VUÔNG': 1,
           'Chương X. MỘT SỐ HÌNH KHỐI TRONG THỰC TIỄN': 1,
           'Chương V. ĐƯỜNG TRÒN': 2,
@@ -206,7 +206,8 @@ export default function Quiz({
             .replace(/\$/g, '')
             .replace(/\\NEQ/g, '≠')
             .replace(/\\NOT=/g, '≠')
-            .replace(/≠/g, '!=');
+            .replace(/≠/g, '!=')
+            .replace(/\^2/g, '²');
           
           for (const key of Object.keys(chapterQuotas)) {
             const keyClean = key.trim().toUpperCase()
@@ -214,7 +215,8 @@ export default function Quiz({
               .replace(/\$/g, '')
               .replace(/\\NEQ/g, '≠')
               .replace(/\\NOT=/g, '≠')
-              .replace(/≠/g, '!=');
+              .replace(/≠/g, '!=')
+              .replace(/\^2/g, '²');
             if (clean === keyClean) {
               return key;
             }

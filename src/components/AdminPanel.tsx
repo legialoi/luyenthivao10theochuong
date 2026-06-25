@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS } from '../lib/firebase';
-import { collection, addDoc, getDocs, query, deleteDoc, doc, Timestamp, orderBy, writeBatch, updateDoc, setDoc, getDoc, limit } from 'firebase/firestore';
+import { collection, addDoc, getDocs, query, deleteDoc, doc, Timestamp, orderBy, writeBatch, updateDoc, setDoc, getDoc, limit, where } from 'firebase/firestore';
 import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2 } from 'lucide-react';
 import MathText from './MathText';
 import * as XLSX from 'xlsx';
@@ -32,56 +32,54 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [pendingUpdates, setPendingUpdates] = useState<Question[]>([]);
   const [filterChapter, setFilterChapter] = useState('Tất cả');
   const [filterCategory, setFilterCategory] = useState('Tất cả');
+  const [filterSchool, setFilterSchool] = useState('Tất cả');
+  const [filterClass, setFilterClass] = useState('Tất cả');
   const hasChanges = pendingDeletes.length > 0 || pendingUpdates.length > 0;
+  const [metadata, setMetadata] = useState<any>(null);
 
   useEffect(() => {
-    fetchQuestions();
-    fetchResults();
+    fetchMetadataAndResults();
   }, []);
 
-  const fetchQuestions = async () => {
+  useEffect(() => {
+    if (filterCategory === 'Tất cả' && filterChapter === 'Tất cả') {
+      setQuestions([]);
+    } else {
+      fetchQuestionsOnDemand(filterCategory, filterChapter);
+    }
+  }, [filterCategory, filterChapter]);
+
+  useEffect(() => {
+    if (filterSchool === 'Tất cả' && filterClass === 'Tất cả') {
+      setResults([]);
+    } else {
+      fetchResultsOnDemand(filterSchool, filterClass);
+    }
+  }, [filterSchool, filterClass]);
+
+  const fetchMetadataAndResults = async () => {
+    setLoading(true);
     try {
-      const q = query(collection(db, 'questions'), orderBy('createdAt', 'desc'));
-      const snapshot = await getDocs(q);
-      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
-      setQuestions(qs);
-      
-      // Only sync metadata if it seems missing or we explicitly want to
-      // (Let's check if it exists first to save writes)
       const metaDoc = await getDoc(doc(db, 'metadata', 'questions'));
-      if (!metaDoc.exists()) {
-        syncMetadata(qs);
+      if (metaDoc.exists()) {
+        const data = metaDoc.data();
+        setMetadata(data);
+      } else {
+        console.log("Metadata not found. Generating initial metadata...");
+        await fetchAllQuestionsAndSync();
       }
     } catch (e) {
-      console.log("Ordered fetch failed, falling back to simple fetch:", e);
-      try {
-        const snapshot = await getDocs(collection(db, 'questions'));
-        let qs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
-        // Sort in memory if index is missing
-        qs.sort((a, b) => {
-          const getTime = (val: any) => {
-            if (!val) return 0;
-            if (typeof val.toMillis === 'function') return val.toMillis();
-            if (val instanceof Date) return val.getTime();
-            if (typeof val === 'string' || typeof val === 'number') return new Date(val).getTime();
-            return 0;
-          };
-          return getTime(b.createdAt) - getTime(a.createdAt);
-        });
-        setQuestions(qs);
-        
-        const metaDoc = await getDoc(doc(db, 'metadata', 'questions'));
-        if (!metaDoc.exists()) {
-          syncMetadata(qs);
-        }
-      } catch (err2) {
-        handleFirestoreError(err2, OperationType.GET, 'questions');
-      }
+      console.log("Failed to load metadata, falling back:", e);
+      await fetchAllQuestionsAndSync();
+    } finally {
+      setLoading(false);
     }
   };
 
-  const syncMetadata = async (qs: Question[]) => {
+  const fetchAllQuestionsAndSync = async () => {
     try {
+      const snapshot = await getDocs(collection(db, 'questions'));
+      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
       const lists = {
         'Số và Đại số': qs.filter((q) => q.category === 'Số và Đại số').map((q) => q.id),
         'Hình học và Đo lường': qs.filter((q) => q.category === 'Hình học và Đo lường').map((q) => q.id),
@@ -93,21 +91,268 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
         }))
       };
       await setDoc(doc(db, 'metadata', 'questions'), lists);
-      localStorage.removeItem('quiz_metadata_ids'); // Clear cache so changes reflect
-      console.log('Metadata synced with', qs.length, 'questions');
-      alert('Đã đồng bộ hóa danh mục câu hỏi (Metadata) thành công!');
+      setMetadata(lists);
+      localStorage.removeItem('quiz_metadata_ids');
+      console.log('Metadata initialized with', qs.length, 'questions');
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'metadata/questions');
     }
   };
 
-  const fetchResults = async () => {
+  const fetchQuestionsOnDemand = async (cat: string, chap: string) => {
+    setLoading(true);
     try {
-      const q = query(collection(db, 'results'), orderBy('submittedAt', 'desc'), limit(200));
+      let q;
+      if (chap !== 'Tất cả') {
+        q = query(
+          collection(db, 'questions'), 
+          where('chapter', '==', chap),
+          orderBy('createdAt', 'desc')
+        );
+      } else if (cat !== 'Tất cả') {
+        q = query(
+          collection(db, 'questions'), 
+          where('category', '==', cat),
+          orderBy('createdAt', 'desc')
+        );
+      } else {
+        setQuestions([]);
+        setLoading(false);
+        return;
+      }
+
       const snapshot = await getDocs(q);
-      setResults(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as QuizResult)));
+      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as Question));
+      setQuestions(qs);
     } catch (e) {
-      handleFirestoreError(e, OperationType.GET, 'results');
+      console.log("Ordered on-demand fetch failed, trying without order (safe fallback):", e);
+      try {
+        let q;
+        if (chap !== 'Tất cả') {
+          q = query(collection(db, 'questions'), where('chapter', '==', chap));
+        } else if (cat !== 'Tất cả') {
+          q = query(collection(db, 'questions'), where('category', '==', cat));
+        } else {
+          setQuestions([]);
+          setLoading(false);
+          return;
+        }
+        const snapshot = await getDocs(q);
+        let qs = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as Question));
+        
+        // Sort in memory
+        qs.sort((a, b) => {
+          const getTime = (val: any) => {
+            if (!val) return 0;
+            if (typeof val.toMillis === 'function') return val.toMillis();
+            if (val instanceof Date) return val.getTime();
+            if (typeof val === 'string' || typeof val === 'number') return new Date(val).getTime();
+            return 0;
+          };
+          return getTime(b.createdAt) - getTime(a.createdAt);
+        });
+        setQuestions(qs);
+      } catch (err2) {
+        handleFirestoreError(err2, OperationType.GET, 'questions');
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const syncMetadata = async () => {
+    setLoading(true);
+    try {
+      const snapshot = await getDocs(collection(db, 'questions'));
+      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
+      const lists = {
+        'Số và Đại số': qs.filter((q) => q.category === 'Số và Đại số').map((q) => q.id),
+        'Hình học và Đo lường': qs.filter((q) => q.category === 'Hình học và Đo lường').map((q) => q.id),
+        'Thống kê và Xác suất': qs.filter((q) => q.category === 'Thống kê và Xác suất').map((q) => q.id),
+        'allQuestions': qs.map((q) => ({
+          id: q.id,
+          chapter: q.chapter || '',
+          category: q.category || ''
+        }))
+      };
+      await setDoc(doc(db, 'metadata', 'questions'), lists);
+      setMetadata(lists);
+      localStorage.removeItem('quiz_metadata_ids');
+      alert('Đã đồng bộ hóa danh mục câu hỏi (Metadata) thành công!');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'metadata/questions');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const syncMetadataIncremental = async (
+    added?: Question[],
+    updated?: Question[],
+    deletedIds?: string[]
+  ) => {
+    try {
+      const metaDocRef = doc(db, 'metadata', 'questions');
+      let currentMeta = metadata;
+      if (!currentMeta) {
+        const metaDoc = await getDoc(metaDocRef);
+        if (metaDoc.exists()) {
+          currentMeta = metaDoc.data();
+        }
+      }
+
+      if (!currentMeta) {
+        await fetchAllQuestionsAndSync();
+        return;
+      }
+
+      let algebra = [...(currentMeta['Số và Đại số'] || [])];
+      let geometry = [...(currentMeta['Hình học và Đo lường'] || [])];
+      let statsList = [...(currentMeta['Thống kê và Xác suất'] || [])];
+      let allQs = [...(currentMeta['allQuestions'] || [])];
+
+      if (deletedIds && deletedIds.length > 0) {
+        const delSet = new Set(deletedIds);
+        algebra = algebra.filter(id => !delSet.has(id));
+        geometry = geometry.filter(id => !delSet.has(id));
+        statsList = statsList.filter(id => !delSet.has(id));
+        allQs = allQs.filter((q: any) => !delSet.has(q.id));
+      }
+
+      if (added && added.length > 0) {
+        added.forEach(q => {
+          const id = q.id!;
+          const cat = q.category;
+          const chap = q.chapter || '';
+
+          if (cat === 'Số và Đại số' && !algebra.includes(id)) algebra.push(id);
+          if (cat === 'Hình học và Đo lường' && !geometry.includes(id)) geometry.push(id);
+          if (cat === 'Thống kê và Xác suất' && !statsList.includes(id)) statsList.push(id);
+
+          if (!allQs.some((item: any) => item.id === id)) {
+            allQs.push({ id, category: cat, chapter: chap });
+          }
+        });
+      }
+
+      if (updated && updated.length > 0) {
+        updated.forEach(upd => {
+          const id = upd.id!;
+          const newCat = upd.category;
+          const newChap = upd.chapter || '';
+
+          const oldQ = allQs.find((q: any) => q.id === id);
+          if (oldQ) {
+            const oldCat = oldQ.category;
+            if (oldCat !== newCat) {
+              if (oldCat === 'Số và Đại số') algebra = algebra.filter(i => i !== id);
+              if (oldCat === 'Hình học và Đo lường') geometry = geometry.filter(i => i !== id);
+              if (oldCat === 'Thống kê và Xác suất') statsList = statsList.filter(i => i !== id);
+
+              if (newCat === 'Số và Đại số' && !algebra.includes(id)) algebra.push(id);
+              if (newCat === 'Hình học và Đo lường' && !geometry.includes(id)) geometry.push(id);
+              if (newCat === 'Thống kê và Xác suất' && !statsList.includes(id)) statsList.push(id);
+            }
+          }
+
+          allQs = allQs.map((q: any) => {
+            if (q.id === id) {
+              return { id, category: newCat, chapter: newChap };
+            }
+            return q;
+          });
+        });
+      }
+
+      const updatedLists = {
+        'Số và Đại số': algebra,
+        'Hình học và Đo lường': geometry,
+        'Thống kê và Xác suất': statsList,
+        'allQuestions': allQs
+      };
+
+      await setDoc(metaDocRef, updatedLists);
+      setMetadata(updatedLists);
+      localStorage.removeItem('quiz_metadata_ids');
+    } catch (err) {
+      console.error("Incremental metadata sync failed:", err);
+    }
+  };
+
+  const fetchResultsOnDemand = async (school: string, className: string) => {
+    setLoading(true);
+    try {
+      let q;
+      if (school !== 'Tất cả' && className !== 'Tất cả') {
+        q = query(
+          collection(db, 'results'),
+          where('school', '==', school),
+          where('class', '==', className),
+          orderBy('submittedAt', 'desc'),
+          limit(300)
+        );
+      } else if (school !== 'Tất cả') {
+        q = query(
+          collection(db, 'results'),
+          where('school', '==', school),
+          orderBy('submittedAt', 'desc'),
+          limit(300)
+        );
+      } else if (className !== 'Tất cả') {
+        q = query(
+          collection(db, 'results'),
+          where('class', '==', className),
+          orderBy('submittedAt', 'desc'),
+          limit(300)
+        );
+      } else {
+        setResults([]);
+        setLoading(false);
+        return;
+      }
+
+      const snapshot = await getDocs(q);
+      setResults(snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as QuizResult)));
+    } catch (e) {
+      console.log("Ordered results fetch failed, falling back to simple query and in-memory sort:", e);
+      try {
+        let q;
+        if (school !== 'Tất cả' && className !== 'Tất cả') {
+          q = query(collection(db, 'results'), where('school', '==', school));
+        } else if (school !== 'Tất cả') {
+          q = query(collection(db, 'results'), where('school', '==', school));
+        } else if (className !== 'Tất cả') {
+          q = query(collection(db, 'results'), where('class', '==', className));
+        } else {
+          setResults([]);
+          setLoading(false);
+          return;
+        }
+
+        const snapshot = await getDocs(q);
+        let rs = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as QuizResult));
+
+        if (school !== 'Tất cả' && className !== 'Tất cả') {
+          rs = rs.filter(r => r.class === className);
+        }
+
+        // Sort in memory by submittedAt descending
+        rs.sort((a, b) => {
+          const getTime = (val: any) => {
+            if (!val) return 0;
+            if (typeof val.toDate === 'function') return val.toDate().getTime();
+            if (val instanceof Date) return val.getTime();
+            return new Date(val).getTime();
+          };
+          return getTime(b.submittedAt) - getTime(a.submittedAt);
+        });
+
+        setResults(rs);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, 'results');
+      }
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -166,9 +411,10 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
             ...finalQuestion,
             createdAt: Timestamp.now()
           });
-          const newQuestions = [...questions, { id: docRef.id, ...finalQuestion, createdAt: new Date() } as Question];
+          const addedQ = { id: docRef.id, ...finalQuestion, createdAt: new Date() } as Question;
+          const newQuestions = [...questions, addedQ];
           setQuestions(newQuestions);
-          syncMetadata(newQuestions);
+          await syncMetadataIncremental([addedQ], [], []);
           alert('Đã thêm câu hỏi thành công!');
         } catch (errAdd) {
           handleFirestoreError(errAdd, OperationType.WRITE, 'questions');
@@ -222,7 +468,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       });
       
       await batch.commit();
-      await syncMetadata(questions);
+      await syncMetadataIncremental([], pendingUpdates, pendingDeletes);
       
       setPendingDeletes([]);
       setPendingUpdates([]);
@@ -262,7 +508,14 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       }
       
       setQuestions([]);
-      await fetchQuestions();
+      const emptyMeta = {
+        'Số và Đại số': [],
+        'Hình học và Đo lường': [],
+        'Thống kê và Xác suất': [],
+        'allQuestions': []
+      };
+      await setDoc(doc(db, 'metadata', 'questions'), emptyMeta);
+      setMetadata(emptyMeta);
       alert('Đã xóa toàn bộ kho đề.');
     } catch (e: any) {
       handleFirestoreError(e, OperationType.DELETE, 'questions');
@@ -309,11 +562,11 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       const remainingQuestions = questions.filter(q => q.chapter?.trim() !== targetChap);
       setQuestions(remainingQuestions);
       
-      const deletedIds = new Set(docsToDelete.map(q => q.id));
-      setPendingDeletes(prev => prev.filter(id => !deletedIds.has(id)));
-      setPendingUpdates(prev => prev.filter(q => !deletedIds.has(q.id)));
+      const deletedIds = docsToDelete.map(q => q.id).filter((id): id is string => !!id);
+      setPendingDeletes(prev => prev.filter(id => !deletedIds.includes(id)));
+      setPendingUpdates(prev => prev.filter(q => !deletedIds.includes(q.id!)));
       
-      await syncMetadata(remainingQuestions);
+      await syncMetadataIncremental([], [], deletedIds);
       alert(`Đã xóa thành công ${docsToDelete.length} câu hỏi thuộc chương "${filterChapter}".`);
       setFilterChapter('Tất cả');
     } catch (e: any) {
@@ -413,6 +666,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
     try {
       const batch = writeBatch(db);
       
+      let addedQuestions: Question[] = [];
       let newLocalQuestions: Question[] = [];
       if (isQuickEdit) {
         previewQuestions.forEach(q => {
@@ -433,7 +687,6 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
         });
 
       } else {
-        const addedQuestions: Question[] = [];
         previewQuestions.forEach(q => {
           const docRef = doc(collection(db, 'questions'));
           const qChapter = (q as any).chapter || '';
@@ -461,10 +714,14 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       await batch.commit();
       setShowPreview(false);
       setPreviewQuestions([]);
-      setIsQuickEdit(false);
       
+      if (isQuickEdit) {
+        await syncMetadataIncremental([], previewQuestions.map(q => q as Question), []);
+      } else {
+        await syncMetadataIncremental(addedQuestions, [], []);
+      }
+      setIsQuickEdit(false);
       setQuestions(newLocalQuestions);
-      syncMetadata(newLocalQuestions);
       
       alert(isQuickEdit ? `Đã cập nhật ${previewQuestions.length} đáp án!` : `Đã lưu thành công ${previewQuestions.length} câu hỏi!`);
     } catch (e) {
@@ -635,16 +892,20 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
     ((q.content || '').toLowerCase().includes((searchTerm || '').toLowerCase()))
   );
 
-  const filteredResults = (results || []).filter(r => 
-    (r.name || '').toLowerCase().includes((searchTerm || '').toLowerCase()) || 
-    (r.class || '').toLowerCase().includes((searchTerm || '').toLowerCase())
-  );
+  const filteredResults = (results || []).filter(r => {
+    const matchesSearch = (r.name || '').toLowerCase().includes((searchTerm || '').toLowerCase()) || 
+                          (r.class || '').toLowerCase().includes((searchTerm || '').toLowerCase()) ||
+                          (r.school || '').toLowerCase().includes((searchTerm || '').toLowerCase());
+    const matchesSchool = filterSchool === 'Tất cả' || r.school === filterSchool;
+    const matchesClass = filterClass === 'Tất cả' || r.class === filterClass;
+    return matchesSearch && matchesSchool && matchesClass;
+  });
 
   const stats = {
-    algebra: (questions || []).filter(q => q && q.category === 'Số và Đại số').length,
-    geometry: (questions || []).filter(q => q && q.category === 'Hình học và Đo lường').length,
-    stats: (questions || []).filter(q => q && q.category === 'Thống kê và Xác suất').length,
-    avgScore: (results || []).length > 0 ? ((results || []).reduce((acc, r) => acc + (r?.score || 0), 0) / (results || []).length).toFixed(1) : '0'
+    algebra: metadata ? (metadata['Số và Đại số'] || []).length : 0,
+    geometry: metadata ? (metadata['Hình học và Đo lường'] || []).length : 0,
+    stats: metadata ? (metadata['Thống kê và Xác suất'] || []).length : 0,
+    avgScore: (filteredResults || []).length > 0 ? ((filteredResults || []).reduce((acc, r) => acc + (r?.score || 0), 0) / (filteredResults || []).length).toFixed(1) : '0'
   };
 
   return (
@@ -717,7 +978,11 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                     { label: 'Hình học', value: stats.geometry, color: 'bg-indigo-500', icon: 'Δ', category: 'Hình học và Đo lường' },
                     { label: 'Thống kê', value: stats.stats, color: 'bg-violet-500', icon: '%', category: 'Thống kê và Xác suất' },
                   ].map((s, i) => (
-                    <div key={i} className="bg-white p-2 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-1.5">
+                    <div 
+                      key={i} 
+                      onClick={() => { setFilterCategory(s.category); setFilterChapter('Tất cả'); }}
+                      className={`bg-white p-2 rounded-xl border transition-all cursor-pointer hover:border-blue-300 hover:shadow-md ${filterCategory === s.category ? 'border-blue-500 ring-2 ring-blue-500/20' : 'border-slate-200'} shadow-sm flex flex-col gap-1.5`}
+                    >
                       <div className="flex items-center justify-between">
                          <div>
                             <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest leading-none mb-0.5">{s.label}</p>
@@ -726,7 +991,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                          <div className={`w-6 h-6 ${s.color} rounded-md flex items-center justify-center text-white font-black text-xs shadow-sm`}>{s.icon}</div>
                       </div>
 
-                      <div className="pt-0.5">
+                      <div className="pt-0.5" onClick={(e) => e.stopPropagation()}>
                         <select 
                           id={`upload-chapter-${s.category}`}
                           className="w-full text-[9px] font-bold py-1 px-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-600 focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer"
@@ -738,7 +1003,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                         </select>
                       </div>
                       
-                      <div className="flex gap-1 pt-1 border-t border-slate-50">
+                      <div className="flex gap-1 pt-1 border-t border-slate-50" onClick={(e) => e.stopPropagation()}>
                          <button 
                             onClick={() => handleSmartUpload(s.category)}
                             title="Upload Word (.docx)"
@@ -778,7 +1043,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                         <Edit2 size={14} /> Sửa đáp án {filterCategory !== 'Tất cả' ? `(${filterCategory.split(' ')[0]})` : ''}
                       </button>
                       <button 
-                        onClick={() => syncMetadata(questions)}
+                        onClick={() => syncMetadata()}
                         title="Đồng bộ Metadata (Tối ưu tải trang)"
                         className="px-2.5 py-1.5 bg-slate-100 text-slate-500 rounded-lg hover:bg-blue-50 hover:text-blue-600 transition-all border border-transparent hover:border-blue-100 font-bold text-[10px] flex items-center gap-1.5"
                       >
@@ -978,9 +1243,19 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                         <tr>
                           <td colSpan={3} className="p-12 text-center">
                              <div className="flex flex-col items-center gap-3 text-slate-300">
-                                <RefreshCw size={48} className="opacity-20 animate-pulse" />
-                                <p className="font-bold text-lg">Kho đề trống</p>
-                                <p className="text-xs uppercase tracking-widest font-black opacity-50">Hãy bắt đầu bằng cách thêm câu hỏi hoặc upload file</p>
+                                {(filterCategory === 'Tất cả' && filterChapter === 'Tất cả') ? (
+                                  <>
+                                    <FileText size={48} className="opacity-20 animate-pulse text-blue-500" />
+                                    <p className="font-bold text-base text-slate-500">Chưa chọn bộ lọc</p>
+                                    <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Vui lòng chọn Phân môn hoặc Chương học ở trên để hiển thị danh sách câu hỏi</p>
+                                  </>
+                                ) : (
+                                  <>
+                                    <RefreshCw size={48} className="opacity-20 animate-pulse" />
+                                    <p className="font-bold text-lg">Không có câu hỏi nào</p>
+                                    <p className="text-xs uppercase tracking-widest font-black opacity-50">Không tìm thấy câu hỏi khớp với bộ lọc đang chọn</p>
+                                  </>
+                                )}
                              </div>
                           </td>
                         </tr>
@@ -1034,10 +1309,53 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
               </div>
             ) : (
               <div key="s" className="space-y-2">
+                 {/* Filters Bar for Results */}
+                 <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row gap-3 items-center justify-between">
+                   <div className="flex flex-col md:flex-row gap-3 w-full md:w-auto">
+                     <div className="flex-1 md:w-64">
+                       <label className="block text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Lọc theo Trường</label>
+                       <select 
+                         value={filterSchool} 
+                         onChange={e => setFilterSchool(e.target.value)}
+                         className="w-full text-xs font-bold py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                       >
+                         <option value="Tất cả">Tất cả Trường</option>
+                         <option value="THCS Triệu Trạch">THCS Triệu Trạch</option>
+                         <option value="TH&THCS Triệu Sơn">TH&THCS Triệu Sơn</option>
+                         <option value="THCS Nguyễn Bỉnh Khiêm">THCS Nguyễn Bỉnh Khiêm</option>
+                         <option value="THCS Lý Tự Trọng">THCS Lý Tự Trọng</option>
+                       </select>
+                     </div>
+                     <div className="flex-1 md:w-48">
+                       <label className="block text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Lọc theo Lớp</label>
+                       <select 
+                         value={filterClass} 
+                         onChange={e => setFilterClass(e.target.value)}
+                         className="w-full text-xs font-bold py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                       >
+                         <option value="Tất cả">Tất cả Lớp</option>
+                         <option value="9A">9A</option>
+                         <option value="9B">9B</option>
+                         <option value="9C">9C</option>
+                         <option value="9D">9D</option>
+                         <option value="9E">9E</option>
+                       </select>
+                     </div>
+                   </div>
+                   
+                   <div className="text-[10px] text-slate-400 font-bold text-right">
+                     {filterSchool === 'Tất cả' && filterClass === 'Tất cả' ? (
+                       <span className="text-rose-500 font-black uppercase tracking-wider animate-pulse">● Vui lòng chọn Trường hoặc Lớp để tải kết quả</span>
+                     ) : (
+                       <span className="text-green-500 font-black uppercase tracking-wider">● Đang hiển thị kết quả đã lọc</span>
+                     )}
+                   </div>
+                 </div>
+
                  <div className="grid grid-cols-4 gap-2">
                     <div className="bg-white p-2.5 rounded-xl border border-slate-200 shadow-sm">
                        <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Số lượt thi</p>
-                       <p className="text-xl font-black text-slate-800 leading-none">{results.length}</p>
+                       <p className="text-xl font-black text-slate-800 leading-none">{filteredResults.length}</p>
                     </div>
                     <div className="bg-blue-600 p-2.5 rounded-xl shadow-md shadow-blue-200 text-white">
                        <p className="text-[8px] font-black text-blue-200 uppercase tracking-widest mb-0.5">Điểm TB (10.0)</p>
@@ -1090,49 +1408,71 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                           </tr>
                        </thead>
                        <tbody className="divide-y divide-slate-100">
-                          {(filteredResults || []).map((r, idx) => (
-                            <tr key={r.id} className="h-8 hover:bg-slate-50 transition-colors">
-                               <td className="pl-4 pr-2 font-black text-slate-400 text-[9px]">{(idx + 1).toString().padStart(2, '0')}</td>
-                               <td className="px-2 text-[9px] text-slate-400">
-                                 {r.submittedAt && typeof (r.submittedAt as any).toDate === 'function' 
-                                   ? (r.submittedAt as Timestamp).toDate().toLocaleString('vi-VN') 
-                                   : 'N/A'}
-                               </td>
-                               <td className="px-2"><span className="px-1.5 py-0 bg-blue-50 text-blue-600 text-[8px] font-black rounded uppercase">{r.class}</span></td>
-                               <td className="px-2"><span className="text-[9px] text-slate-500 font-bold uppercase">{r.school || 'N/A'}</span></td>
-                               <td className="px-2 font-medium text-slate-800 text-[10px]">{r.name}</td><td className="px-2"><span className="text-[9px] text-slate-600 font-bold truncate max-w-[140px] inline-block font-sans" title={r.chapter || "Thi tổng hợp"}>{r.chapter ? r.chapter.split(". ")[0] : "Tổng hợp"}</span></td>
-                               <td className="pr-4 pl-2 text-right">
-                                  <div className="flex flex-col items-end">
-                                     <span className={`text-base font-black ${r.score >= 8.0 ? 'text-green-500' : r.score >= 5.0 ? 'text-blue-500' : 'text-orange-500'}`}>
-                                       {r.score.toFixed(1)}
-                                     </span>
-                                  </div>
-                               </td>
-                               <td className="pr-2 text-center">
-                                  <div className="flex items-center justify-center gap-1">
-                                    <button 
-                                      onClick={() => handleDeleteResult(r.id!)}
-                                      className={`p-1 flex items-center justify-center rounded transition-all ${
-                                        confirmDeleteResultId === r.id 
-                                          ? 'bg-red-600 text-white font-bold text-[8px] px-1.5 py-0.5 shadow-sm' 
-                                          : 'text-slate-300 hover:text-red-500 hover:bg-red-50'
-                                      }`}
-                                      title={confirmDeleteResultId === r.id ? 'Xác nhận xóa?' : 'Xoá kết quả'}
-                                    >
-                                      {confirmDeleteResultId === r.id ? 'Xóa?' : <Trash2 size={12} />}
-                                    </button>
-                                    {confirmDeleteResultId === r.id && (
-                                      <button 
-                                        onClick={() => setConfirmDeleteResultId(null)}
-                                        className="text-[8px] font-black text-slate-400 hover:text-slate-600 px-1 py-0.5 hover:bg-slate-100 rounded transition"
-                                      >
-                                        Hủy
-                                      </button>
+                          {(filteredResults || []).length === 0 ? (
+                            <tr>
+                              <td colSpan={8} className="p-12 text-center">
+                                 <div className="flex flex-col items-center gap-3 text-slate-300">
+                                    {(filterSchool === 'Tất cả' && filterClass === 'Tất cả') ? (
+                                      <>
+                                         <BarChart2 size={48} className="opacity-20 animate-pulse text-blue-500" />
+                                         <p className="font-bold text-base text-slate-500">Chưa chọn bộ lọc</p>
+                                         <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Vui lòng chọn Trường hoặc Lớp ở trên để hiển thị danh sách kết quả học sinh</p>
+                                      </>
+                                    ) : (
+                                      <>
+                                         <RefreshCw size={48} className="opacity-20 animate-pulse" />
+                                         <p className="font-bold text-lg">Không có kết quả nào</p>
+                                         <p className="text-xs uppercase tracking-widest font-black opacity-50">Không tìm thấy kết quả khớp với bộ lọc đang chọn</p>
+                                      </>
                                     )}
-                                  </div>
-                               </td>
+                                 </div>
+                              </td>
                             </tr>
-                          ))}
+                          ) : (
+                            filteredResults.map((r, idx) => (
+                              <tr key={r.id} className="h-8 hover:bg-slate-50 transition-colors">
+                                 <td className="pl-4 pr-2 font-black text-slate-400 text-[9px]">{(idx + 1).toString().padStart(2, '0')}</td>
+                                 <td className="px-2 text-[9px] text-slate-400">
+                                   {r.submittedAt && typeof (r.submittedAt as any).toDate === 'function' 
+                                     ? (r.submittedAt as Timestamp).toDate().toLocaleString('vi-VN') 
+                                     : 'N/A'}
+                                 </td>
+                                 <td className="px-2"><span className="px-1.5 py-0 bg-blue-50 text-blue-600 text-[8px] font-black rounded uppercase">{r.class}</span></td>
+                                 <td className="px-2"><span className="text-[9px] text-slate-500 font-bold uppercase">{r.school || 'N/A'}</span></td>
+                                 <td className="px-2 font-medium text-slate-800 text-[10px]">{r.name}</td><td className="px-2"><span className="text-[9px] text-slate-600 font-bold truncate max-w-[140px] inline-block font-sans" title={r.chapter || "Thi tổng hợp"}>{r.chapter ? r.chapter.split(". ")[0] : "Tổng hợp"}</span></td>
+                                 <td className="pr-4 pl-2 text-right">
+                                    <div className="flex flex-col items-end">
+                                       <span className={`text-base font-black ${r.score >= 8.0 ? 'text-green-500' : r.score >= 5.0 ? 'text-blue-500' : 'text-orange-500'}`}>
+                                         {r.score.toFixed(1)}
+                                       </span>
+                                    </div>
+                                 </td>
+                                 <td className="pr-2 text-center">
+                                    <div className="flex items-center justify-center gap-1">
+                                      <button 
+                                        onClick={() => handleDeleteResult(r.id!)}
+                                        className={`p-1 flex items-center justify-center rounded transition-all ${
+                                          confirmDeleteResultId === r.id 
+                                            ? 'bg-red-600 text-white font-bold text-[8px] px-1.5 py-0.5 shadow-sm' 
+                                            : 'text-slate-300 hover:text-red-500 hover:bg-red-50'
+                                        }`}
+                                        title={confirmDeleteResultId === r.id ? 'Xác nhận xóa?' : 'Xoá kết quả'}
+                                      >
+                                        {confirmDeleteResultId === r.id ? 'Xóa?' : <Trash2 size={12} />}
+                                      </button>
+                                      {confirmDeleteResultId === r.id && (
+                                        <button 
+                                          onClick={() => setConfirmDeleteResultId(null)}
+                                          className="text-[8px] font-black text-slate-400 hover:text-slate-600 px-1 py-0.5 hover:bg-slate-100 rounded transition"
+                                        >
+                                          Hủy
+                                        </button>
+                                      )}
+                                    </div>
+                                 </td>
+                              </tr>
+                            ))
+                          )}
                        </tbody>
                     </table>
                  </div>

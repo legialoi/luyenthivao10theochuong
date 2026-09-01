@@ -41,6 +41,11 @@ export const PART_CHAPTERS: Record<string, string[]> = {
   ]
 };
 
+export const SCHOOL_CLASSES: Record<string, string[]> = {
+  'THCS Nam Cửa Việt': ['9A8', '9A9', 'Học thêm'],
+  'TH&THCS Đoàn Khuê': ['Học thêm']
+};
+
 export interface QuizResult {
   id?: string;
   name: string;
@@ -49,6 +54,14 @@ export interface QuizResult {
   score: number;
   startTime: Timestamp | Date;
   submittedAt: Timestamp | Date;
+}
+
+export interface ClassRoster {
+  id?: string;
+  school: string;
+  class: string;
+  students: string[];
+  updatedAt?: Timestamp | Date;
 }
 
 export enum OperationType {

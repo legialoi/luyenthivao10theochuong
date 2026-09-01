@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS } from '../lib/firebase';
+import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, query, deleteDoc, doc, Timestamp, orderBy, writeBatch, updateDoc, setDoc, getDoc, limit, where } from 'firebase/firestore';
-import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2 } from 'lucide-react';
+import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2, AlertTriangle, Users } from 'lucide-react';
 import MathText from './MathText';
 import * as XLSX from 'xlsx';
 import { parseWordToQuiz, ParsedQuestion } from '../utils/wordParser';
 import QuizPreview from './QuizPreview';
 import { solveQuestion } from '../services/geminiService';
+import StudentWeeklyStatsModal from './StudentWeeklyStatsModal';
 
 export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<'questions' | 'stats'>('questions');
@@ -34,6 +35,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [filterCategory, setFilterCategory] = useState('Tất cả');
   const [filterSchool, setFilterSchool] = useState('Tất cả');
   const [filterClass, setFilterClass] = useState('Tất cả');
+  const [showWeeklyStatsModal, setShowWeeklyStatsModal] = useState(false);
   const hasChanges = pendingDeletes.length > 0 || pendingUpdates.length > 0;
   const [metadata, setMetadata] = useState<any>(null);
 
@@ -932,6 +934,12 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
           >
             <BarChart2 size={18} /> Kết quả học sinh
           </button>
+          <button 
+            onClick={() => setShowWeeklyStatsModal(true)}
+            className="w-full flex items-center gap-3 px-4 py-3 rounded-xl font-bold text-sm transition-all text-rose-300 hover:bg-rose-500/10 border border-rose-500/20 mt-2"
+          >
+            <AlertTriangle size={18} className="text-rose-400 animate-pulse" /> Thống kê tháng
+          </button>
         </nav>
 
         <div className="p-6 border-t border-white/10">
@@ -1315,16 +1323,14 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                      <div className="flex-1 md:w-64">
                        <label className="block text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Lọc theo Trường</label>
                        <select 
-                         value={filterSchool} 
-                         onChange={e => setFilterSchool(e.target.value)}
-                         className="w-full text-xs font-bold py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
-                       >
-                         <option value="Tất cả">Tất cả Trường</option>
-                         <option value="THCS Triệu Trạch">THCS Triệu Trạch</option>
-                         <option value="TH&THCS Triệu Sơn">TH&THCS Triệu Sơn</option>
-                         <option value="THCS Nguyễn Bỉnh Khiêm">THCS Nguyễn Bỉnh Khiêm</option>
-                         <option value="THCS Lý Tự Trọng">THCS Lý Tự Trọng</option>
-                       </select>
+                          value={filterSchool} 
+                          onChange={e => setFilterSchool(e.target.value)}
+                          className="w-full text-xs font-bold py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                        >
+                          <option value="Tất cả">Tất cả Trường</option>
+                          <option value="THCS Nam Cửa Việt">THCS Nam Cửa Việt</option>
+                          <option value="TH&THCS Đoàn Khuê">TH&THCS Đoàn Khuê</option>
+                        </select>
                      </div>
                      <div className="flex-1 md:w-48">
                        <label className="block text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Lọc theo Lớp</label>
@@ -1334,11 +1340,12 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                          className="w-full text-xs font-bold py-1.5 px-3 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
                        >
                          <option value="Tất cả">Tất cả Lớp</option>
-                         <option value="9A">9A</option>
-                         <option value="9B">9B</option>
-                         <option value="9C">9C</option>
-                         <option value="9D">9D</option>
-                         <option value="9E">9E</option>
+                         {(filterSchool === 'Tất cả' 
+                            ? Array.from(new Set(Object.values(SCHOOL_CLASSES).flat()))
+                            : (SCHOOL_CLASSES[filterSchool] || [])
+                          ).map(cls => (
+                            <option key={cls} value={cls}>{cls}</option>
+                          ))}
                        </select>
                      </div>
                    </div>
@@ -1368,7 +1375,14 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                              <span className="w-1 h-1 bg-green-500 rounded-full inline-block"></span> Syncing
                           </p>
                        </div>
-                       <div className="flex gap-1.5">
+                       <div className="flex gap-1.5 items-center">
+                          <button 
+                            onClick={() => setShowWeeklyStatsModal(true)} 
+                            className="px-2.5 py-1 bg-rose-600 text-white font-black text-[8px] rounded-md hover:bg-rose-700 transition-all uppercase tracking-widest border border-rose-600 flex items-center gap-1 shadow-sm shadow-rose-200 cursor-pointer"
+                            title="Thống kê học sinh theo tháng và 4 tuần theo danh sách lớp"
+                          >
+                            <AlertTriangle size={10} /> Thống kê tháng
+                          </button>
                           <button onClick={handleExportExcel} className="px-2 py-1 bg-blue-50 text-blue-600 font-bold text-[8px] rounded-md hover:bg-blue-600 hover:text-white transition-all uppercase tracking-widest border border-blue-100 flex items-center gap-1">
                              <Download size={10} /> Excel
                           </button>
@@ -1480,6 +1494,14 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
             )}
         </div>
       </main>
+
+      {/* 4-Week Attendance and Under 5 Score Statistics Modal */}
+      <StudentWeeklyStatsModal
+        isOpen={showWeeklyStatsModal}
+        onClose={() => setShowWeeklyStatsModal(false)}
+        initialSchool={filterSchool}
+        initialClass={filterClass}
+      />
     </div>
   );
 }

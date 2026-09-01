@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from 'react';
-import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS } from '../lib/firebase';
+import React, { useState, useEffect, useRef } from 'react';
+import { db, Question, QuizResult, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, query, where, documentId, limit } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
-import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, Trophy, BookOpen, Award, Bookmark, ArrowRight, School, GraduationCap } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, Trophy, BookOpen, Award, Bookmark, ArrowRight, School, GraduationCap, Users, ChevronDown, Check, Sparkles } from 'lucide-react';
 import MathText from './MathText';
+import { getRosterSuggestions, matchResultToRoster } from '../utils/nameMatcher';
 
 export default function Quiz({ 
   onBack, 
@@ -16,7 +17,11 @@ export default function Quiz({
 }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [currentStep, setCurrentStep] = useState<'info' | 'select_chapter' | 'doing' | 'result' | 'review'>('info');
-  const [studentInfo, setStudentInfo] = useState({ name: '', class: '', school: '' });
+  const [studentInfo, setStudentInfo] = useState({ name: '', class: '9A8', school: 'THCS Nam Cửa Việt' });
+  const [classRoster, setClassRoster] = useState<string[]>([]);
+  const [isRosterLoading, setIsRosterLoading] = useState(false);
+  const [showNameDropdown, setShowNameDropdown] = useState(false);
+  const nameDropdownRef = useRef<HTMLDivElement>(null);
   const [selectedChapter, setSelectedChapter] = useState<string | null>(null);
   const [userAnswers, setUserAnswers] = useState<Record<number, number>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -27,6 +32,69 @@ export default function Quiz({
   const [loadingQuestions, setLoadingQuestions] = useState(false);
   const [selectedPart, setSelectedPart] = useState<string>('');
   const [selectedChapDropdown, setSelectedChapDropdown] = useState<string>('');
+
+  // Close name dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (nameDropdownRef.current && !nameDropdownRef.current.contains(event.target as Node)) {
+        setShowNameDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Fetch class roster dynamically whenever school or class changes
+  useEffect(() => {
+    if (!studentInfo.school || !studentInfo.class) {
+      setClassRoster([]);
+      return;
+    }
+
+    let isMounted = true;
+    const fetchRoster = async () => {
+      setIsRosterLoading(true);
+      try {
+        const rosterDocId = `roster_${studentInfo.school.trim().replace(/\s+/g, '_')}_${studentInfo.class.trim().replace(/\s+/g, '_')}`;
+        const rosterSnap = await getDoc(doc(db, 'class_rosters', rosterDocId));
+
+        if (rosterSnap.exists()) {
+          const data = rosterSnap.data() as ClassRoster;
+          if (isMounted && data.students && data.students.length > 0) {
+            setClassRoster(data.students.sort((a, b) => a.localeCompare(b, 'vi')));
+            setIsRosterLoading(false);
+            return;
+          }
+        }
+
+        // Fallback: Query results for past students from this school & class
+        const q = query(
+          collection(db, 'results'),
+          where('class', '==', studentInfo.class)
+        );
+        const resultsSnap = await getDocs(q);
+        const fetchedResults = resultsSnap.docs
+          .map(d => d.data())
+          .filter(r => !studentInfo.school || r.school === studentInfo.school || !r.school);
+        const distinctNames = Array.from<string>(
+          new Set(fetchedResults.map(r => (r.name || '').trim()).filter(Boolean))
+        );
+
+        if (isMounted) {
+          setClassRoster(distinctNames.sort((a, b) => a.localeCompare(b, 'vi')));
+        }
+      } catch (err) {
+        console.error('Error loading class roster:', err);
+      } finally {
+        if (isMounted) setIsRosterLoading(false);
+      }
+    };
+
+    fetchRoster();
+    return () => {
+      isMounted = false;
+    };
+  }, [studentInfo.school, studentInfo.class]);
 
   const fetchAndRandomize = async (chap?: string, isPractice = false) => {
     setLoadingQuestions(true);
@@ -474,56 +542,210 @@ export default function Quiz({
           <p className="text-[10px] md:text-sm text-slate-400 mt-1 font-semibold italic">Nhập thông tin đề thi & vào làm ngay</p>
         </div>
         <div className="space-y-3 md:space-y-4">
-          <div>
-            <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Họ và Tên</label>
-            <input 
-              type="text" 
-              className="w-full p-2.5 md:p-3.5 bg-slate-50 border border-slate-100 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold"
-              placeholder="Nguyễn Văn A"
-              value={studentInfo.name}
-              onChange={e => setStudentInfo({...studentInfo, name: e.target.value})}
-            />
-          </div>
+          {/* Trường & Lớp (Đặt lên trước để danh sách học sinh theo lớp hiển thị chuẩn xác) */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Lớp / Khối</label>
+              <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1 flex items-center gap-1">
+                <School size={12} className="text-blue-500" />
+                <span>Trường</span>
+              </label>
               <div className="relative">
                 <select 
-                  className="w-full p-2.5 md:p-3.5 bg-slate-50 border border-slate-100 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold appearance-none cursor-pointer"
-                  value={studentInfo.class}
-                  onChange={e => setStudentInfo({...studentInfo, class: e.target.value})}
-                >
-                  <option value="">Lớp...</option>
-                  <option value="9A">9A</option>
-                  <option value="9B">9B</option>
-                  <option value="9C">9C</option>
-                  <option value="9D">9D</option>
-                  <option value="9E">9E</option>
-                </select>
-                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none opacity-40">
-                  <ChevronRight size={14} className="rotate-90" />
-                </div>
-              </div>
-            </div>
-            <div>
-              <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Trường</label>
-              <div className="relative">
-                <select 
-                  className="w-full p-2.5 md:p-3.5 bg-slate-50 border border-slate-100 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold appearance-none cursor-pointer"
+                  className="w-full p-2.5 md:p-3 bg-slate-50 border border-slate-200 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-xs md:text-sm font-bold appearance-none cursor-pointer"
                   value={studentInfo.school}
-                  onChange={e => setStudentInfo({...studentInfo, school: e.target.value})}
+                  onChange={e => {
+                    const newSchool = e.target.value;
+                    const availableClasses = SCHOOL_CLASSES[newSchool] || ['Học thêm'];
+                    const newClass = availableClasses.includes(studentInfo.class) ? studentInfo.class : availableClasses[0];
+                    setStudentInfo({ ...studentInfo, school: newSchool, class: newClass, name: '' });
+                    setShowNameDropdown(false);
+                  }}
                 >
-                  <option value="">Trường...</option>
-                  <option value="THCS Triệu Trạch">THCS Triệu Trạch</option>
-                  <option value="TH&THCS Triệu Sơn">TH&THCS Triệu Sơn</option>
-                  <option value="THCS Nguyễn Bỉnh Khiêm">THCS Nguyễn Bỉnh Khiêm</option>
-                  <option value="THCS Lý Tự Trọng">THCS Lý Tự Trọng</option>
+                  <option value="THCS Nam Cửa Việt">THCS Nam Cửa Việt</option>
+                  <option value="TH&THCS Đoàn Khuê">TH&THCS Đoàn Khuê</option>
                 </select>
                 <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none opacity-40">
                   <ChevronRight size={14} className="rotate-90" />
                 </div>
               </div>
             </div>
+
+            <div>
+              <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1 flex items-center gap-1">
+                <GraduationCap size={12} className="text-blue-500" />
+                <span>Lớp</span>
+              </label>
+              <div className="relative">
+                <select 
+                  className="w-full p-2.5 md:p-3 bg-slate-50 border border-slate-200 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-xs md:text-sm font-bold appearance-none cursor-pointer"
+                  value={studentInfo.class}
+                  onChange={e => {
+                    setStudentInfo({ ...studentInfo, class: e.target.value, name: '' });
+                    setShowNameDropdown(false);
+                  }}
+                >
+                  {(SCHOOL_CLASSES[studentInfo.school] || ['9A8', '9A9', 'Học thêm']).map(cls => (
+                    <option key={cls} value={cls}>
+                      {cls === 'Học thêm' ? 'Lớp Học thêm' : `Lớp ${cls}`}
+                    </option>
+                  ))}
+                </select>
+                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none opacity-40">
+                  <ChevronRight size={14} className="rotate-90" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Họ và Tên với Menu Thả gợi ý & Chọn nhanh theo danh sách lớp */}
+          <div ref={nameDropdownRef} className="relative">
+            <div className="flex items-center justify-between mb-1 ml-1">
+              <label className="text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
+                <User size={12} className="text-blue-500" />
+                <span>Họ và Tên</span>
+              </label>
+              {classRoster.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setShowNameDropdown(!showNameDropdown)}
+                  className="text-[10px] font-bold text-blue-600 hover:text-blue-700 flex items-center gap-1 cursor-pointer transition-colors bg-blue-50 px-2 py-0.5 rounded-md hover:bg-blue-100"
+                >
+                  <Users size={11} />
+                  <span>DS Lớp {studentInfo.class} ({classRoster.length} HS)</span>
+                  <ChevronDown size={12} className={`transition-transform ${showNameDropdown ? 'rotate-180' : ''}`} />
+                </button>
+              )}
+            </div>
+
+            <div className="relative">
+              <input 
+                type="text" 
+                className={`w-full p-2.5 md:p-3.5 bg-slate-50 border rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold pr-10 ${
+                  classRoster.includes(studentInfo.name.trim()) 
+                    ? 'border-emerald-300 bg-emerald-50/30' 
+                    : 'border-slate-200'
+                }`}
+                placeholder="Nhập hoặc chọn tên học sinh..."
+                value={studentInfo.name}
+                onFocus={() => {
+                  if (classRoster.length > 0) setShowNameDropdown(true);
+                }}
+                onChange={e => {
+                  setStudentInfo({ ...studentInfo, name: e.target.value });
+                  if (classRoster.length > 0) setShowNameDropdown(true);
+                }}
+              />
+              
+              {/* Nút bật tắt dropdown menu */}
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={() => setShowNameDropdown(!showNameDropdown)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-blue-600 rounded-lg hover:bg-slate-100 transition-colors"
+                title="Bấm để mở danh sách học sinh lớp"
+              >
+                {isRosterLoading ? (
+                  <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
+                ) : (
+                  <ChevronDown size={18} className={`transition-transform ${showNameDropdown ? 'rotate-180 text-blue-600' : ''}`} />
+                )}
+              </button>
+            </div>
+
+            {/* Trạng thái xác nhận tên */}
+            {studentInfo.name && (
+              <div className="mt-1 flex items-center justify-between text-[11px] px-1">
+                {classRoster.includes(studentInfo.name.trim()) ? (
+                  <span className="text-emerald-700 font-bold flex items-center gap-1">
+                    <CheckCircle2 size={13} className="text-emerald-600" />
+                    Đúng tên trong danh sách lớp {studentInfo.class}
+                  </span>
+                ) : classRoster.length > 0 ? (
+                  <span className="text-amber-600 font-medium flex items-center gap-1">
+                    <Sparkles size={12} className="text-amber-500" />
+                    Chưa khớp danh sách lớp (Hãy chọn từ menu bên dưới để thống kê chính xác nhất)
+                  </span>
+                ) : null}
+              </div>
+            )}
+
+            {/* Menu Thả / Dropdown Danh Sách Học Sinh */}
+            <AnimatePresence>
+              {showNameDropdown && (
+                <motion.div
+                  initial={{ opacity: 0, y: -6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -6 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute z-50 left-0 right-0 top-full mt-1.5 bg-white border border-slate-200 rounded-xl shadow-2xl overflow-hidden max-h-60 flex flex-col"
+                >
+                  <div className="p-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between text-[11px] font-bold text-slate-600">
+                    <span className="flex items-center gap-1.5">
+                      <Users size={13} className="text-blue-600" />
+                      Danh sách lớp {studentInfo.class} ({studentInfo.school})
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-normal">
+                      {getRosterSuggestions(studentInfo.name, classRoster).length} gợi ý
+                    </span>
+                  </div>
+
+                  <div className="overflow-y-auto divide-y divide-slate-100 flex-1 p-1">
+                    {getRosterSuggestions(studentInfo.name, classRoster).length === 0 ? (
+                      <div className="p-4 text-center text-xs text-slate-400">
+                        {classRoster.length === 0 ? (
+                          <span>Chưa có danh sách lớp được tải lên. Bạn có thể tự nhập tên trực tiếp.</span>
+                        ) : (
+                          <span>Không tìm thấy học sinh phù hợp với từ khóa "{studentInfo.name}".</span>
+                        )}
+                      </div>
+                    ) : (
+                      getRosterSuggestions(studentInfo.name, classRoster).map((stName, idx) => {
+                        const isSelected = studentInfo.name.trim().toLowerCase() === stName.trim().toLowerCase();
+                        const parts = stName.split(' ');
+                        const given = parts[parts.length - 1];
+                        const initials = parts.map(p => p[0]).join('').slice(0, 2).toUpperCase();
+
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => {
+                              setStudentInfo({ ...studentInfo, name: stName });
+                              setShowNameDropdown(false);
+                            }}
+                            className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between text-xs transition-colors group ${
+                              isSelected 
+                                ? 'bg-blue-600 text-white font-black' 
+                                : 'hover:bg-blue-50 text-slate-800 font-medium'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-black shrink-0 ${
+                                isSelected ? 'bg-white text-blue-600' : 'bg-slate-100 text-slate-600 group-hover:bg-blue-200 group-hover:text-blue-800'
+                              }`}>
+                                {initials}
+                              </div>
+                              <div>
+                                <div className="text-xs font-bold leading-tight">{stName}</div>
+                                <div className={`text-[10px] ${isSelected ? 'text-blue-100' : 'text-slate-400'}`}>
+                                  Lớp {studentInfo.class}
+                                </div>
+                              </div>
+                            </div>
+
+                            {isSelected && <Check size={14} className="text-white shrink-0" />}
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <div className="p-2 bg-slate-50 border-t border-slate-100 text-[10px] text-slate-400 text-center">
+                    💡 Click để chọn đúng tên giúp việc thống kê tháng chính xác tuyệt đối
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
           <div className="border-t border-slate-100 pt-3 md:pt-4">

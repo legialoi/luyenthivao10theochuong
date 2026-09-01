@@ -34,6 +34,23 @@
         "submittedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["name", "class", "score", "startTime", "submittedAt"]
+    },
+    "ClassRoster": {
+      "title": "Class Roster",
+      "description": "Student roster list for a class and school",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "school": { "type": "string" },
+        "class": { "type": "string" },
+        "students": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of student full names"
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["school", "class", "students"]
     }
   },
   "firestore": {
@@ -44,6 +61,10 @@
     "results": {
       "schema": "Result",
       "description": "Collection of student quiz results"
+    },
+    "class_rosters": {
+      "schema": "ClassRoster",
+      "description": "Collection of class student rosters"
     }
   }
 }

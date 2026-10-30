@@ -22,10 +22,11 @@ service cloud.firestore {
     function isValidQuestion(data) {
       return data.content is string && data.content.size() <= 5000 &&
              data.options is list && data.options.size() == 4 &&
-             data.correctAnswer is int && data.correctAnswer >= 0 && data.correctAnswer <= 3 &&
+             data.correctAnswer is int && data.correctAnswer >= -1 && data.correctAnswer <= 3 &&
              data.category in ["Số và Đại số", "Hình học và Đo lường", "Thống kê và Xác suất"] &&
              data.createdAt is timestamp &&
-             (!('chapter' in data) || data.chapter is string);
+             (!('chapter' in data) || data.chapter is string) &&
+             (!('answerSeal' in data) || data.answerSeal is string);
     }
 
     match /questions/{questionId} {
@@ -43,26 +44,30 @@ service cloud.firestore {
              data.class is string && data.class.size() <= 50 &&
              data.score is number && data.score >= 0 && data.score <= 10 &&
              data.startTime is timestamp &&
-             data.submittedAt == request.time &&
+             (data.submittedAt == request.time || data.submittedAt is timestamp) &&
              data.correctCount is int &&
              data.totalQuestions is int &&
              data.chapter is string &&
-             (!('school' in data) || data.school is string);
+             (!('school' in data) || data.school is string) &&
+             (!('encryptedAnswers' in data) || data.encryptedAnswers is string) &&
+             (!('tabSwitchCount' in data) || data.tabSwitchCount is int);
     }
 
     match /results/{resultId} {
-      allow list: if true; // Allow students to see leaderboard
-      allow get: if true;
+      allow read: if true;
       allow create: if isValidResult(incoming());
       allow delete: if isAdmin();
     }
 
     match /leaderboard_cache/{type} {
-      allow read: if true;
-      allow write: if true;
+      allow read, write: if true;
     }
 
     match /class_rosters/{rosterId} {
+      allow read, write: if true;
+    }
+
+    match /test/{docId} {
       allow read, write: if true;
     }
   }

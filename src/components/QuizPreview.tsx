@@ -2,6 +2,7 @@ import React from 'react';
 import { motion } from 'motion/react';
 import { Check, X, Save, Eye, Pencil, CheckCircle2, Trash2 } from 'lucide-react';
 import MathText from './MathText';
+import MathEquationToolbar from './MathEquationToolbar';
 import { ParsedQuestion } from '../utils/wordParser';
 
 interface QuizPreviewProps {
@@ -15,6 +16,7 @@ interface QuizPreviewProps {
 
 export default function QuizPreview({ questions, onConfirm, onCancel, onUpdateQuestion, onDeleteQuestion, loading }: QuizPreviewProps) {
   const [editStates, setEditStates] = React.useState<Record<number, 'none' | 'content' | 'options'>>({});
+  const [activeOptionTarget, setActiveOptionTarget] = React.useState<Record<number, number>>({});
   const [confirmDeleteIdx, setConfirmDeleteIdx] = React.useState<number | null>(null);
 
   const toggleEdit = (idx: number) => {
@@ -137,38 +139,84 @@ export default function QuizPreview({ questions, onConfirm, onCancel, onUpdateQu
                     
                     <div className="text-base md:text-xl font-semibold text-slate-800 mb-6 md:mb-8 leading-relaxed overflow-x-auto max-w-full">
                       {state === 'content' ? (
-                        <textarea 
-                          className="w-full p-4 bg-blue-50 border border-blue-200 rounded-2xl text-base md:text-lg font-medium outline-none h-32 focus:ring-2 focus:ring-blue-500 transition-all"
-                          value={q.content}
-                          onChange={(e) => onUpdateQuestion(idx, { ...q, content: e.target.value })}
-                          placeholder="Nhập nội dung câu hỏi..."
-                          autoFocus
-                        />
+                        <div className="space-y-3">
+                          <MathEquationToolbar
+                            showTargetSelector={false}
+                            onInsert={(latex) => {
+                              onUpdateQuestion(idx, {
+                                ...q,
+                                content: q.content ? `${q.content} ${latex}` : latex
+                              });
+                            }}
+                          />
+                          <textarea 
+                            className="w-full p-4 bg-blue-50 border border-blue-200 rounded-2xl text-base md:text-lg font-medium outline-none h-32 focus:ring-2 focus:ring-blue-500 transition-all"
+                            value={q.content}
+                            onChange={(e) => onUpdateQuestion(idx, { ...q, content: e.target.value })}
+                            placeholder="Nhập nội dung câu hỏi..."
+                            autoFocus
+                          />
+                          {q.content.trim() && (
+                            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-sm md:text-base font-medium">
+                              <span className="block text-[10px] font-black text-blue-600 uppercase tracking-widest mb-1">Xem trước công thức:</span>
+                              <MathText text={q.content} />
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <MathText text={q.content} />
                       )}
                     </div>
 
+                    {state === 'options' && (
+                      <div className="mb-4">
+                        <MathEquationToolbar
+                          activeTarget={activeOptionTarget[idx] ?? 0}
+                          onTargetChange={(t) => {
+                            if (typeof t === 'number') {
+                              setActiveOptionTarget(prev => ({ ...prev, [idx]: t }));
+                            }
+                          }}
+                          onInsert={(latex, targetField) => {
+                            const optIndex = typeof targetField === 'number' ? targetField : (activeOptionTarget[idx] ?? 0);
+                            const nextOptions = [...q.options];
+                            nextOptions[optIndex] = nextOptions[optIndex]
+                              ? `${nextOptions[optIndex]} ${latex}`
+                              : latex;
+                            onUpdateQuestion(idx, { ...q, options: nextOptions });
+                          }}
+                        />
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3 md:gap-4">
                       {q.options.map((opt, oIdx) => (
                         <div key={oIdx} className="relative group/opt">
                           {state === 'options' ? (
-                            <div className="flex items-center gap-2 bg-blue-50 p-2 rounded-xl border border-blue-100">
-                               <div 
-                                onClick={() => onUpdateQuestion(idx, { ...q, correctAnswer: oIdx })}
-                                className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 cursor-pointer transition-all ${q.correctAnswer === oIdx ? 'bg-green-500 text-white shadow-lg' : 'bg-white text-slate-400 border border-slate-200 shadow-inner'}`}>
-                                  {String.fromCharCode(65 + oIdx)}
+                            <div className="space-y-1.5">
+                              <div className={`flex items-center gap-2 bg-blue-50 p-2 rounded-xl border transition-all ${(activeOptionTarget[idx] ?? 0) === oIdx ? 'border-indigo-400 ring-2 ring-indigo-100' : 'border-blue-100'}`}>
+                                 <div 
+                                  onClick={() => onUpdateQuestion(idx, { ...q, correctAnswer: oIdx })}
+                                  className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 cursor-pointer transition-all ${q.correctAnswer === oIdx ? 'bg-green-500 text-white shadow-lg' : 'bg-white text-slate-400 border border-slate-200 shadow-inner'}`}>
+                                    {String.fromCharCode(65 + oIdx)}
+                                  </div>
+                                  <input 
+                                    onFocus={() => setActiveOptionTarget(prev => ({ ...prev, [idx]: oIdx }))}
+                                    className="flex-1 bg-transparent border-none outline-none text-sm md:text-base font-medium py-2 px-1 focus:ring-0"
+                                    value={opt}
+                                    onChange={(e) => {
+                                      const nextOptions = [...q.options];
+                                      nextOptions[oIdx] = e.target.value;
+                                      onUpdateQuestion(idx, { ...q, options: nextOptions });
+                                    }}
+                                    placeholder={`Đáp án ${String.fromCharCode(65 + oIdx)}...`}
+                                  />
+                              </div>
+                              {opt.trim() && (
+                                <div className="px-3 py-1.5 bg-slate-50 border border-slate-200/70 rounded-lg text-xs text-slate-700 overflow-x-auto">
+                                  <MathText text={opt} />
                                 </div>
-                                <input 
-                                  className="flex-1 bg-transparent border-none outline-none text-sm md:text-base font-medium py-2 px-1 focus:ring-0"
-                                  value={opt}
-                                  onChange={(e) => {
-                                    const nextOptions = [...q.options];
-                                    nextOptions[oIdx] = e.target.value;
-                                    onUpdateQuestion(idx, { ...q, options: nextOptions });
-                                  }}
-                                  placeholder={`Đáp án ${String.fromCharCode(65 + oIdx)}...`}
-                                />
+                              )}
                             </div>
                           ) : (
                             <button 

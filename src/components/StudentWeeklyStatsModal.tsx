@@ -40,6 +40,8 @@ interface StudentStatRow {
   name: string;
   school: string;
   className: string;
+  isOutsideRoster?: boolean;
+  studentResults: QuizResult[];
   weeks: StudentWeekStatus[];
   unmetWeeksCount: number;
   is4WeeksConsecutiveUnmet: boolean;
@@ -88,6 +90,14 @@ export default function StudentWeeklyStatsModal({
 
   // Selected student for drill-down details
   const [selectedStudentName, setSelectedStudentName] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const notify = (text: string, type: 'success' | 'error' = 'success') => {
+    setStatusMessage({ type, text });
+    setTimeout(() => {
+      setStatusMessage(prev => (prev?.text === text ? null : prev));
+    }, 5000);
+  };
 
   // Reset loaded status and roster when criteria changes so user clicks "Thống kê" to query
   useEffect(() => {
@@ -95,6 +105,7 @@ export default function StudentWeeklyStatsModal({
     setResults([]);
     setRoster([]);
     setRosterInputText('');
+    setSelectedStudentName(null);
   }, [school, className, selectedYear, selectedMonth, timeMode]);
 
   // Generate the 4 weeks based on timeMode
@@ -190,7 +201,7 @@ export default function StudentWeeklyStatsModal({
 
       setResults(fetchedResults);
 
-      // If no roster saved yet, auto-populate with students found in results or default sample
+      // If no roster saved yet, auto-populate with students found in results
       if (currentRoster.length === 0) {
         const distinctNames = Array.from<string>(new Set(fetchedResults.map(r => r.name.trim()).filter(Boolean)));
         if (distinctNames.length > 0) {
@@ -216,12 +227,10 @@ export default function StudentWeeklyStatsModal({
       const names = rosterInputText
         .split('\n')
         .map(line => {
-          // Clean up leading numbers e.g. "1. Nguyen Van A", "01 - Nguyen Van A"
           return line.replace(/^\s*\d+[\.\-\s\)]+\s*/, '').trim();
         })
         .filter(n => n.length > 0);
 
-      // Remove duplicates
       const uniqueNames = Array.from<string>(new Set(names)).sort((a, b) => a.localeCompare(b, 'vi'));
 
       const rosterDocId = `roster_${school.trim().replace(/\s+/g, '_')}_${className.trim().replace(/\s+/g, '_')}`;
@@ -233,13 +242,18 @@ export default function StudentWeeklyStatsModal({
       };
 
       await setDoc(doc(db, 'class_rosters', rosterDocId), payload);
+      try {
+        sessionStorage.setItem(`cached_${rosterDocId}`, JSON.stringify(uniqueNames));
+      } catch (e) {}
+
       setRoster(uniqueNames);
       setRosterInputText(uniqueNames.join('\n'));
       setRosterSaveSuccess(true);
+      notify(`Đã lưu danh sách ${uniqueNames.length} học sinh lớp ${className}!`, 'success');
       setTimeout(() => {
         setRosterSaveSuccess(false);
         setShowRosterEditor(false);
-      }, 1200);
+      }, 1000);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'class_rosters');
     } finally {
@@ -251,11 +265,12 @@ export default function StudentWeeklyStatsModal({
     if (!school || !className) return;
     setIsDeleting(true);
     try {
-      // 1. Delete class roster doc
       const rosterDocId = `roster_${school.trim().replace(/\s+/g, '_')}_${className.trim().replace(/\s+/g, '_')}`;
       await deleteDoc(doc(db, 'class_rosters', rosterDocId));
+      try {
+        sessionStorage.removeItem(`cached_${rosterDocId}`);
+      } catch (e) {}
 
-      // 2. If option is 'all', also delete quiz results for this class
       let deletedResultsCount = 0;
       if (option === 'all') {
         const q = query(
@@ -281,9 +296,9 @@ export default function StudentWeeklyStatsModal({
       setShowDeleteModal(false);
 
       if (option === 'all') {
-        alert(`Đã xoá danh sách học sinh và ${deletedResultsCount} bài nộp của lớp ${className} (${school})!`);
+        notify(`Đã xoá danh sách học sinh và ${deletedResultsCount} bài nộp của lớp ${className} (${school})!`, 'success');
       } else {
-        alert(`Đã xoá thành công danh sách học sinh của lớp ${className} (${school})!`);
+        notify(`Đã xoá thành công danh sách học sinh của lớp ${className} (${school})!`, 'success');
       }
     } catch (err) {
       console.error('Failed to delete class data:', err);
@@ -301,13 +316,13 @@ export default function StudentWeeklyStatsModal({
     reader.onload = (evt) => {
       try {
         const data = evt.target?.result;
-        const workbook = XLSX.read(data, { type: 'binary' });
+        const workbook = XLSX.read(data, { type: 'array' });
         const firstSheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[firstSheetName];
         const rows: any[][] = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
 
         if (rows.length === 0) {
-          alert('Tệp Excel trống!');
+          notify('Tệp Excel trống!', 'error');
           return;
         }
 
@@ -355,7 +370,6 @@ export default function StudentWeeklyStatsModal({
           }
         }
 
-        // Helper to normalize class names e.g. "9A9", "Lớp 9A9", "9.9", "9/9"
         const normalizeClass = (str: string) => {
           return str.toLowerCase().replace(/[\s\.\/\-_]/g, '').replace(/^lớp/, '');
         };
@@ -365,7 +379,6 @@ export default function StudentWeeklyStatsModal({
         let filteredOtherClassCount = 0;
 
         if (headerRowIndex !== -1) {
-          // Parse rows using header mapping
           for (let r = headerRowIndex + 1; r < rows.length; r++) {
             const row = rows[r];
             if (!row || row.length === 0) continue;
@@ -375,7 +388,6 @@ export default function StudentWeeklyStatsModal({
               rowClassStr = String(row[colIndexClass]).trim();
             }
 
-            // If class column exists, filter strictly by current class
             if (colIndexClass !== -1 && rowClassStr) {
               const rowClassNorm = normalizeClass(rowClassStr);
               if (rowClassNorm !== targetClassNorm && !rowClassNorm.includes(targetClassNorm) && !targetClassNorm.includes(rowClassNorm)) {
@@ -393,14 +405,12 @@ export default function StudentWeeklyStatsModal({
               fullName = `${hoDem} ${ten}`.trim();
             }
 
-            // Remove STT prefix if present
             fullName = fullName.replace(/^\s*\d+[\.\-\s\)]+\s*/, '').trim();
             if (fullName && fullName.length > 1 && !/^\d+$/.test(fullName)) {
               extractedNames.push(fullName);
             }
           }
         } else {
-          // Fallback: search cells that look like Vietnamese full names
           rows.forEach(row => {
             if (!row || row.length === 0) return;
             for (const cell of row) {
@@ -423,25 +433,24 @@ export default function StudentWeeklyStatsModal({
         const uniqueExtracted = Array.from<string>(new Set(extractedNames)).sort((a, b) => a.localeCompare(b, 'vi'));
 
         if (uniqueExtracted.length > 0) {
-          // Replace roster for current class to avoid mixed-class accumulation
           setRosterInputText(uniqueExtracted.join('\n'));
-          let msg = `✅ Đã trích xuất ${uniqueExtracted.length} học sinh cho lớp ${className}!`;
+          let msg = `Đã trích xuất ${uniqueExtracted.length} học sinh cho lớp ${className}.`;
           if (filteredOtherClassCount > 0) {
-            msg += `\n(Đã tự động lọc và bỏ qua ${filteredOtherClassCount} học sinh thuộc các lớp khác trong tệp).`;
+            msg += ` (Đã lọc bỏ ${filteredOtherClassCount} HS lớp khác).`;
           }
-          msg += `\n\nNhấn nút "Lưu Danh Sách Lớp" để cập nhật vào hệ thống.`;
-          alert(msg);
+          msg += ` Nhấn "Lưu DS Lớp ${className}" để hoàn tất!`;
+          notify(msg, 'success');
         } else {
-          alert(`Không tìm thấy danh sách học sinh của lớp ${className} trong tệp Excel.\nVui lòng kiểm tra lại cột Lớp hoặc chọn đúng file danh sách của lớp!`);
+          notify(`Không tìm thấy danh sách học sinh của lớp ${className} trong tệp Excel!`, 'error');
         }
       } catch (err) {
         console.error('Error reading excel file:', err);
-        alert('Lỗi khi đọc tệp Excel. Vui lòng kiểm tra lại định dạng tệp!');
+        notify('Lỗi khi đọc tệp Excel. Vui lòng kiểm tra lại định dạng tệp!', 'error');
       } finally {
         e.target.value = '';
       }
     };
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
   };
 
   const getResultDate = (submittedAt: any): Date | null => {
@@ -453,39 +462,47 @@ export default function StudentWeeklyStatsModal({
     return null;
   };
 
-  // Compile calculations for each student in the roster
+  // Compile calculations for each student in the roster (plus any unmatched test-takers in this class)
   const studentStats: StudentStatRow[] = useMemo(() => {
-    // If roster is empty, take all unique student names from results
-    const effectiveRoster = roster.length > 0 
+    const baseRoster = roster.length > 0 
       ? roster 
       : Array.from<string>(new Set(results.map(r => r.name.trim()).filter(Boolean)));
 
-    // Pre-map all results to canonical student names in effectiveRoster
     const resultsByStudentName = new Map<string, QuizResult[]>();
-    effectiveRoster.forEach(name => resultsByStudentName.set(name, []));
+    const outsideRosterSet = new Set<string>();
+    baseRoster.forEach(name => resultsByStudentName.set(name, []));
 
     results.forEach(res => {
       const rawName = (res.name || '').trim();
       if (!rawName) return;
 
-      // Smart match to roster
-      const matchedCanonical = matchResultToRoster(rawName, effectiveRoster);
+      const matchedCanonical = matchResultToRoster(rawName, baseRoster);
       if (matchedCanonical && resultsByStudentName.has(matchedCanonical)) {
         resultsByStudentName.get(matchedCanonical)!.push(res);
       } else {
-        // Fallback: match by direct lowercase
-        const directMatch = effectiveRoster.find(n => n.toLowerCase() === rawName.toLowerCase());
+        const directMatch = baseRoster.find(n => n.toLowerCase() === rawName.toLowerCase());
         if (directMatch && resultsByStudentName.has(directMatch)) {
           resultsByStudentName.get(directMatch)!.push(res);
+        } else {
+          // Student took a test in this class/school but wasn't in the uploaded roster
+          const existingUnmatched = Array.from(outsideRosterSet).find(
+            n => n.toLowerCase() === rawName.toLowerCase()
+          );
+          const keyName = existingUnmatched || rawName;
+          if (!resultsByStudentName.has(keyName)) {
+            resultsByStudentName.set(keyName, []);
+            outsideRosterSet.add(keyName);
+          }
+          resultsByStudentName.get(keyName)!.push(res);
         }
       }
     });
 
-    return effectiveRoster.map(studentName => {
-      // Find all results matching student name (via smart matcher)
+    const allStudentNames = [...baseRoster, ...Array.from(outsideRosterSet)];
+
+    return allStudentNames.map(studentName => {
       const studentResults = resultsByStudentName.get(studentName) || [];
 
-      // Sort studentResults by date ascending
       const sortedResults = [...studentResults].sort((a, b) => {
         const da = getResultDate(a.submittedAt)?.getTime() || 0;
         const db = getResultDate(b.submittedAt)?.getTime() || 0;
@@ -493,7 +510,6 @@ export default function StudentWeeklyStatsModal({
       });
 
       const weekStatuses: StudentWeekStatus[] = weeks.map(week => {
-        // Find tests submitted in this week's date range (already sorted ascending by time)
         const testsInWeek = sortedResults.filter(r => {
           const d = getResultDate(r.submittedAt);
           if (!d) return false;
@@ -510,21 +526,18 @@ export default function StudentWeeklyStatsModal({
         const avgScore = count > 0 ? scores.reduce((a, b) => a + b, 0) / count : null;
         
         // Điều kiện tuần xuất sắc:
-        // Tuần đạt từ 8.0 điểm trở lên sẽ được tính là 1 tuần đạt xuất sắc,
-        // các lần làm sau trong tuần nếu có chỉ cần làm đạt từ 5.0 điểm trở lên là tuần đó vẫn được tính.
-        const firstGte8Index = testsInWeek.findIndex(t => t.score >= 8.0);
-        const hasGte8InThisWeek = firstGte8Index !== -1;
+        // Có ít nhất 1 bài >= 8.0 điểm mà tất cả các lần làm sau bài đó trong tuần đều >= 5.0 điểm
+        const hasValidGte8Streak = testsInWeek.some(
+          (t, idx) => t.score >= 8.0 && testsInWeek.slice(idx + 1).every(sub => sub.score >= 5.0)
+        );
+        const hasGte8InThisWeek = testsInWeek.some(t => t.score >= 8.0);
         
         let isCountedWeek = false;
         let countedReason: 'gte_8' | 'gte_5_after_8' | 'none' = 'none';
 
-        if (hasGte8InThisWeek) {
-          const subsequentTests = testsInWeek.slice(firstGte8Index + 1);
-          const subsequentAllPass = subsequentTests.every(t => t.score >= 5.0);
-          if (subsequentAllPass) {
-            isCountedWeek = true;
-            countedReason = 'gte_8';
-          }
+        if (hasValidGte8Streak) {
+          isCountedWeek = true;
+          countedReason = 'gte_8';
         }
 
         let isUnmet = false;
@@ -538,7 +551,6 @@ export default function StudentWeeklyStatsModal({
           label = 'Không làm bài';
           subLabel = '0 lượt nộp';
         } else if (passCount >= 1) {
-          // Ít nhất 1 lần làm >= 5đ: Đạt chuẩn tuần!
           isUnmet = false;
           unmetReason = 'passed';
           const highestPass = Math.max(...passScores);
@@ -554,7 +566,6 @@ export default function StudentWeeklyStatsModal({
               : `1 lần ≥ 5đ (${highestPass.toFixed(1)}đ)`;
           }
         } else {
-          // Có làm bài nhưng TẤT CẢ các lần đều < 5đ
           isUnmet = true;
           unmetReason = 'below_5';
           label = `Dưới 5đ (${maxScore?.toFixed(1)}đ)`;
@@ -579,12 +590,8 @@ export default function StudentWeeklyStatsModal({
       });
 
       const unmetWeeksCount = weekStatuses.filter(w => w.isUnmet).length;
-      // 4 consecutive weeks unmet: all 4 weeks are unmet!
       const is4WeeksConsecutiveUnmet = weekStatuses.every(w => w.isUnmet);
-
-      // Count of weeks counted towards excellence (>= 8 in week, or >= 5 after ever hitting >= 8)
       const countedWeeksCount = weekStatuses.filter(w => w.isCountedWeek).length;
-      // If 3 or more weeks are counted -> Excellent!
       const isExcellent = countedWeeksCount >= 3;
 
       const allScores = studentResults.map(r => r.score);
@@ -594,6 +601,8 @@ export default function StudentWeeklyStatsModal({
         name: studentName,
         school,
         className,
+        isOutsideRoster: outsideRosterSet.has(studentName),
+        studentResults: sortedResults,
         weeks: weekStatuses,
         unmetWeeksCount,
         is4WeeksConsecutiveUnmet,
@@ -978,13 +987,21 @@ export default function StudentWeeklyStatsModal({
           </div>
 
           {/* Quick Rule Helper Single-Line Note */}
-          <div className="flex items-center gap-2 text-[10px] text-blue-900 bg-blue-50/70 border border-blue-100 px-2.5 py-1 rounded-lg">
-            <Info size={13} className="text-blue-600 shrink-0" />
-            <div className="truncate flex items-center gap-2 flex-wrap">
+          <div className="flex items-center justify-between gap-2 text-[10px] text-blue-900 bg-blue-50/70 border border-blue-100 px-2.5 py-1 rounded-lg">
+            <div className="flex items-center gap-2 truncate flex-wrap">
+              <Info size={13} className="text-blue-600 shrink-0" />
               <span><strong>Quy tắc:</strong> ≥1 bài ≥5đ = Đạt tuần.</span>
               <span className="text-amber-800 font-bold">• Tuần có bài ≥8đ (các bài sau ≥5đ) = Tuần XS.</span>
-              <span className="text-blue-800 font-bold">• ≥3 tuần XS = Danh sách Xuất sắc ⭐.</span>
+              <span className="text-blue-800 font-bold">• ≥3 tuần XS = Xuất sắc ⭐.</span>
+              <span className="text-slate-500">• Bấm vào tên HS để xem chi tiết từng lần thi.</span>
             </div>
+            {statusMessage && (
+              <div className={`px-2.5 py-0.5 rounded-md font-bold text-[10px] shrink-0 flex items-center gap-1 ${
+                statusMessage.type === 'error' ? 'bg-rose-600 text-white' : 'bg-emerald-600 text-white'
+              }`}>
+                <span>{statusMessage.text}</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -1052,19 +1069,21 @@ export default function StudentWeeklyStatsModal({
                     return (
                       <tr
                         key={student.name}
-                        className={`transition-colors hover:bg-slate-50/80 ${
+                        onClick={() => setSelectedStudentName(student.name)}
+                        className={`transition-colors hover:bg-blue-50/50 cursor-pointer ${
                           isAlert 
                             ? 'bg-rose-50/40 font-semibold' 
                             : isExc 
                               ? 'bg-amber-50/20' 
                               : ''
                         }`}
+                        title="Bấm để xem lịch sử các bài nộp của học sinh này"
                       >
                         <td className="py-2.5 pl-4 pr-2 text-center font-bold text-slate-400 text-[11px]">
                           {(idx + 1).toString().padStart(2, '0')}
                         </td>
                         <td className="py-2.5 px-3">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             {isExc ? (
                               <span className="p-0.5 rounded bg-amber-100 text-amber-600 border border-amber-300 shadow-xs" title="Học sinh Xuất sắc (≥3 tuần đạt chuẩn)">
                                 <Star size={11} className="fill-amber-500 text-amber-500" />
@@ -1076,12 +1095,17 @@ export default function StudentWeeklyStatsModal({
                             ) : (
                               <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" title="Chưa đạt một số tuần"></span>
                             )}
-                            <span className={`font-bold ${isAlert ? 'text-rose-950' : isExc ? 'text-slate-900 font-black' : 'text-slate-900'}`}>
+                            <span className={`font-bold hover:text-blue-600 transition-colors ${isAlert ? 'text-rose-950' : isExc ? 'text-slate-900 font-black' : 'text-slate-900'}`}>
                               {student.name}
                             </span>
                             {isExc && (
                               <span className="bg-amber-100 text-amber-800 text-[9px] font-black uppercase px-1.5 py-0.2 rounded border border-amber-300 shadow-2xs">
                                 Xuất sắc
+                              </span>
+                            )}
+                            {student.isOutsideRoster && (
+                              <span className="bg-slate-100 text-slate-600 text-[8px] font-bold px-1.5 py-0.2 rounded border border-slate-200" title="Học sinh có nộp bài nhưng chưa có trong danh sách lớp đã lưu">
+                                Ngoài DS lớp
                               </span>
                             )}
                           </div>
@@ -1114,7 +1138,7 @@ export default function StudentWeeklyStatsModal({
 
                           return (
                             <td key={wIdx} className="py-2 px-2 text-center" title={tooltipScores}>
-                              <div className={`inline-flex flex-col items-center justify-center p-1.5 px-2 rounded-xl border text-[10px] ${badgeBg} transition hover:scale-105 cursor-help min-w-[110px]`}>
+                              <div className={`inline-flex flex-col items-center justify-center p-1.5 px-2 rounded-xl border text-[10px] ${badgeBg} transition hover:scale-105 min-w-[110px]`}>
                                 <div className="flex items-center gap-1 font-black">
                                   {icon}
                                   <span>{w.label}</span>
@@ -1179,6 +1203,90 @@ export default function StudentWeeklyStatsModal({
         </div>
 
       </div>
+
+      {/* Student Detailed Submission History Modal */}
+      {selectedStudentName && (() => {
+        const studentObj = studentStats.find(s => s.name === selectedStudentName);
+        if (!studentObj) return null;
+        const submissionsDesc = [...studentObj.studentResults].reverse();
+
+        return (
+          <div className="fixed inset-0 z-60 flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-xs animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-2xl w-full max-h-[82vh] flex flex-col overflow-hidden">
+              <div className="p-4 md:px-6 bg-slate-900 text-white flex items-center justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm md:text-base font-black">{studentObj.name}</h4>
+                    <span className="px-2 py-0.5 bg-blue-500/20 text-blue-300 border border-blue-400/30 rounded-full text-[10px] font-black">
+                      Lớp {studentObj.className}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Tổng cộng {submissionsDesc.length} lần nộp bài • Cao nhất: {studentObj.highestOverallScore !== null ? `${studentObj.highestOverallScore.toFixed(1)}đ` : 'Chưa có'}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setSelectedStudentName(null)}
+                  className="w-7 h-7 rounded-full bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center cursor-pointer"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                {submissionsDesc.length === 0 ? (
+                  <div className="p-8 text-center text-slate-400 text-xs font-bold">
+                    Học sinh này chưa có lượt nộp bài nào được ghi nhận.
+                  </div>
+                ) : (
+                  submissionsDesc.map((sub, idx) => {
+                    const d = getResultDate(sub.submittedAt);
+                    const matchedWeek = d ? weeks.find(w => d >= w.startDate && d <= w.endDate) : null;
+                    return (
+                      <div key={sub.id || idx} className="p-3 rounded-2xl border border-slate-100 bg-slate-50/70 flex items-center justify-between gap-3">
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-slate-800">
+                              {d ? d.toLocaleString('vi-VN') : 'N/A'}
+                            </span>
+                            {matchedWeek && (
+                              <span className="px-2 py-0.2 bg-blue-100 text-blue-700 rounded text-[10px] font-black">
+                                {matchedWeek.label}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-500 truncate">
+                            Phần thi: <strong className="text-slate-700">{sub.chapter || 'Tổng hợp'}</strong>
+                            {sub.correctCount !== undefined && ` • Đúng ${sub.correctCount}/${sub.totalQuestions || 16} câu`}
+                          </div>
+                        </div>
+                        <div className={`px-3 py-1.5 rounded-xl font-black text-sm shrink-0 ${
+                          sub.score >= 8.0
+                            ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                            : sub.score >= 5.0
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                              : 'bg-rose-100 text-rose-700 border border-rose-200'
+                        }`}>
+                          {sub.score.toFixed(1)}đ
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="p-3 px-6 bg-slate-50 border-t border-slate-200 flex justify-end">
+                <button
+                  onClick={() => setSelectedStudentName(null)}
+                  className="px-4 py-1.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition cursor-pointer"
+                >
+                  Đóng
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Delete Confirmation Modal */}
       {showDeleteModal && (

@@ -1,13 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, query, deleteDoc, doc, Timestamp, orderBy, writeBatch, updateDoc, setDoc, getDoc, limit, where } from 'firebase/firestore';
-import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2, AlertTriangle, Users } from 'lucide-react';
+import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2, AlertTriangle, Users, ShieldCheck } from 'lucide-react';
 import MathText from './MathText';
 import * as XLSX from 'xlsx';
 import { parseWordToQuiz, ParsedQuestion } from '../utils/wordParser';
 import QuizPreview from './QuizPreview';
 import { solveQuestion } from '../services/geminiService';
 import StudentWeeklyStatsModal from './StudentWeeklyStatsModal';
+import MathEquationToolbar from './MathEquationToolbar';
+import { hydrateQuestionForAdmin, prepareQuestionForFirestore } from '../utils/security';
 
 export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<'questions' | 'stats'>('questions');
@@ -28,6 +30,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [confirmDeleteResultId, setConfirmDeleteResultId] = useState<string | null>(null);
   const [isConfirmingDeleteAllResults, setIsConfirmingDeleteAllResults] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
+  const [equationTarget, setEquationTarget] = useState<'content' | number>('content');
   const [isQuickEdit, setIsQuickEdit] = useState(false);
   const [pendingDeletes, setPendingDeletes] = useState<string[]>([]);
   const [pendingUpdates, setPendingUpdates] = useState<Question[]>([]);
@@ -124,7 +127,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       }
 
       const snapshot = await getDocs(q);
-      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as Question));
+      const qs = snapshot.docs.map(d => hydrateQuestionForAdmin({ id: d.id, ...(d.data() as any) } as Question));
       setQuestions(qs);
     } catch (e) {
       console.log("Ordered on-demand fetch failed, trying without order (safe fallback):", e);
@@ -140,7 +143,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
           return;
         }
         const snapshot = await getDocs(q);
-        let qs = snapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as any) } as Question));
+        let qs = snapshot.docs.map(d => hydrateQuestionForAdmin({ id: d.id, ...(d.data() as any) } as Question));
         
         // Sort in memory
         qs.sort((a, b) => {
@@ -166,7 +169,26 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
     setLoading(true);
     try {
       const snapshot = await getDocs(collection(db, 'questions'));
-      const qs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
+      const rawDocs = snapshot.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
+
+      // Encrypt any legacy plain-text questions in Firestore so F12 Network tab never exposes correctAnswer
+      const unsealedDocs = rawDocs.filter(q => !q.answerSeal || (typeof q.correctAnswer === 'number' && q.correctAnswer >= 0));
+      for (let i = 0; i < unsealedDocs.length; i += 450) {
+        const batch = writeBatch(db);
+        const chunk = unsealedDocs.slice(i, i + 450);
+        chunk.forEach(q => {
+          if (q.id) {
+            const sealed = prepareQuestionForFirestore(q);
+            batch.update(doc(db, 'questions', q.id), {
+              correctAnswer: sealed.correctAnswer,
+              answerSeal: sealed.answerSeal
+            });
+          }
+        });
+        await batch.commit();
+      }
+
+      const qs = rawDocs.map(q => hydrateQuestionForAdmin(q));
       const lists = {
         'Số và Đại số': qs.filter((q) => q.category === 'Số và Đại số').map((q) => q.id),
         'Hình học và Đo lường': qs.filter((q) => q.category === 'Hình học và Đo lường').map((q) => q.id),
@@ -180,7 +202,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       await setDoc(doc(db, 'metadata', 'questions'), lists);
       setMetadata(lists);
       localStorage.removeItem('quiz_metadata_ids');
-      alert('Đã đồng bộ hóa danh mục câu hỏi (Metadata) thành công!');
+      alert(`Đã đồng bộ Metadata và mã hóa bảo mật ${rawDocs.length} câu hỏi thành công!`);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'metadata/questions');
     } finally {
@@ -398,7 +420,13 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       // But Word upload is the primary case for "questions without answers".
 
       if (editId) {
-        const updatedQuestion = { ...finalQuestion, id: editId, updatedAt: Timestamp.now() } as Question;
+        const sealed = prepareQuestionForFirestore({ ...finalQuestion, id: editId });
+        const updatedQuestion = hydrateQuestionForAdmin({
+          ...finalQuestion,
+          id: editId,
+          answerSeal: sealed.answerSeal,
+          updatedAt: Timestamp.now()
+        } as Question);
         setPendingUpdates(prev => {
           const filtered = prev.filter(p => p.id !== editId);
           return [...filtered, updatedQuestion];
@@ -409,15 +437,21 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
         setEditId(null);
       } else {
         try {
+          const sealedPayload = prepareQuestionForFirestore(finalQuestion);
           const docRef = await addDoc(collection(db, 'questions'), {
-            ...finalQuestion,
+            ...sealedPayload,
             createdAt: Timestamp.now()
           });
-          const addedQ = { id: docRef.id, ...finalQuestion, createdAt: new Date() } as Question;
+          const addedQ = hydrateQuestionForAdmin({
+            id: docRef.id,
+            ...finalQuestion,
+            answerSeal: sealedPayload.answerSeal,
+            createdAt: new Date()
+          } as Question);
           const newQuestions = [...questions, addedQ];
           setQuestions(newQuestions);
           await syncMetadataIncremental([addedQ], [], []);
-          alert('Đã thêm câu hỏi thành công!');
+          alert('Đã thêm và mã hóa đáp án câu hỏi thành công!');
         } catch (errAdd) {
           handleFirestoreError(errAdd, OperationType.WRITE, 'questions');
         }
@@ -437,12 +471,13 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   };
 
   const handleEditClick = (q: Question) => {
+    const hydrated = hydrateQuestionForAdmin(q);
     setNewQuestion({
-      content: q.content,
-      options: [...q.options],
-      correctAnswer: q.correctAnswer,
-      category: q.category,
-      chapter: q.chapter || ''
+      content: hydrated.content,
+      options: [...hydrated.options],
+      correctAnswer: hydrated.correctAnswer,
+      category: hydrated.category,
+      chapter: hydrated.chapter || ''
     });
     setEditId(q.id!);
     setShowAddForm(true);
@@ -463,9 +498,10 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
         batch.delete(doc(db, 'questions', id));
       });
       
-      // Xử lý cập nhật
+      // Xử lý cập nhật (mã hóa đáp án trước khi lưu lên Firestore)
       pendingUpdates.forEach(q => {
-        const { id, ...data } = q;
+        const sealed = prepareQuestionForFirestore(q);
+        const { id, ...data } = sealed;
         batch.update(doc(db, 'questions', id!), { ...data });
       });
       
@@ -663,69 +699,116 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
     input.click();
   };
 
+  const [quickEditOriginalIds, setQuickEditOriginalIds] = useState<string[]>([]);
+
   const confirmSaveQuestions = async () => {
     setLoading(true);
     try {
-      const batch = writeBatch(db);
-      
       let addedQuestions: Question[] = [];
       let newLocalQuestions: Question[] = [];
+      let deletedQuickEditIds: string[] = [];
+
       if (isQuickEdit) {
+        const remainingIds = new Set(previewQuestions.map(q => q.id).filter(Boolean) as string[]);
+        deletedQuickEditIds = quickEditOriginalIds.filter(id => !remainingIds.has(id));
+
+        const ops: Array<{ type: 'update' | 'delete'; id: string; data?: any }> = [];
+        deletedQuickEditIds.forEach(id => ops.push({ type: 'delete', id }));
         previewQuestions.forEach(q => {
           if (q.id) {
-            batch.update(doc(db, 'questions', q.id), {
-              correctAnswer: q.correctAnswer,
-              updatedAt: Timestamp.now()
+            const sealed = prepareQuestionForFirestore(q);
+            ops.push({
+              type: 'update',
+              id: q.id,
+              data: {
+                content: q.content,
+                options: q.options,
+                correctAnswer: sealed.correctAnswer,
+                answerSeal: sealed.answerSeal,
+                updatedAt: Timestamp.now()
+              }
             });
           }
         });
-        
-        const previewMap = new Map<string, Question>(previewQuestions.filter(q => !!q.id).map(q => [q.id!, q as any]));
-        newLocalQuestions = questions.map(q => {
-          if (q.id && previewMap.has(q.id)) {
-            return { ...q, correctAnswer: previewMap.get(q.id)!.correctAnswer };
-          }
-          return q;
-        });
 
-      } else {
-        previewQuestions.forEach(q => {
-          const docRef = doc(collection(db, 'questions'));
-          const qChapter = (q as any).chapter || '';
-          batch.set(docRef, {
-            content: q.content,
-            options: q.options,
-            correctAnswer: q.correctAnswer,
-            category: q.category,
-            chapter: qChapter,
-            createdAt: Timestamp.now()
+        for (let i = 0; i < ops.length; i += 450) {
+          const batch = writeBatch(db);
+          ops.slice(i, i + 450).forEach(op => {
+            if (op.type === 'delete') {
+              batch.delete(doc(db, 'questions', op.id));
+            } else {
+              batch.update(doc(db, 'questions', op.id), op.data);
+            }
           });
-          addedQuestions.push({
-            id: docRef.id,
-            content: q.content,
-            options: q.options,
-            correctAnswer: q.correctAnswer,
-            category: q.category,
-            chapter: qChapter,
-            createdAt: new Date()
-          } as Question);
-        });
+          await batch.commit();
+        }
+
+        const deletedSet = new Set(deletedQuickEditIds);
+        const previewMap = new Map<string, ParsedQuestion>(
+          previewQuestions.filter(q => !!q.id).map(q => [q.id!, q])
+        );
+        newLocalQuestions = questions
+          .filter(q => !q.id || !deletedSet.has(q.id))
+          .map(q => {
+            if (q.id && previewMap.has(q.id)) {
+              const p = previewMap.get(q.id)!;
+              const sealed = prepareQuestionForFirestore({ ...p, id: q.id });
+              return hydrateQuestionForAdmin({
+                ...q,
+                content: p.content,
+                options: p.options,
+                correctAnswer: p.correctAnswer,
+                answerSeal: sealed.answerSeal
+              });
+            }
+            return q;
+          });
+      } else {
+        for (let i = 0; i < previewQuestions.length; i += 450) {
+          const batch = writeBatch(db);
+          const chunk = previewQuestions.slice(i, i + 450);
+          chunk.forEach(q => {
+            const docRef = doc(collection(db, 'questions'));
+            const qChapter = (q as any).chapter || '';
+            const sealed = prepareQuestionForFirestore({ ...q, id: docRef.id });
+            batch.set(docRef, {
+              content: q.content,
+              options: q.options,
+              correctAnswer: sealed.correctAnswer,
+              answerSeal: sealed.answerSeal,
+              category: q.category,
+              chapter: qChapter,
+              createdAt: Timestamp.now()
+            });
+            addedQuestions.push(hydrateQuestionForAdmin({
+              id: docRef.id,
+              content: q.content,
+              options: q.options,
+              correctAnswer: q.correctAnswer,
+              answerSeal: sealed.answerSeal,
+              category: q.category,
+              chapter: qChapter,
+              createdAt: new Date()
+            } as Question));
+          });
+          await batch.commit();
+        }
         newLocalQuestions = [...addedQuestions, ...questions];
       }
       
-      await batch.commit();
       setShowPreview(false);
       setPreviewQuestions([]);
+      setQuickEditOriginalIds([]);
       
       if (isQuickEdit) {
-        await syncMetadataIncremental([], previewQuestions.map(q => q as Question), []);
+        await syncMetadataIncremental([], previewQuestions.map(q => q as Question), deletedQuickEditIds);
       } else {
         await syncMetadataIncremental(addedQuestions, [], []);
       }
       setIsQuickEdit(false);
       setQuestions(newLocalQuestions);
       
-      alert(isQuickEdit ? `Đã cập nhật ${previewQuestions.length} đáp án!` : `Đã lưu thành công ${previewQuestions.length} câu hỏi!`);
+      alert(isQuickEdit ? `Đã cập nhật ${previewQuestions.length} câu hỏi!` : `Đã lưu thành công ${addedQuestions.length} câu hỏi!`);
     } catch (e) {
       handleFirestoreError(e, OperationType.WRITE, 'questions');
     }
@@ -741,10 +824,11 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
     }
 
     if (targetQuestions.length === 0) {
-      alert('Không có câu hỏi để chỉnh sửa!');
+      alert('Không có câu hỏi để chỉnh sửa! Vui lòng chọn Phân môn hoặc Chương trước.');
       return;
     }
     
+    setQuickEditOriginalIds(targetQuestions.map(q => q.id!).filter(Boolean));
     setPreviewQuestions(targetQuestions as ParsedQuestion[]);
     setIsQuickEdit(true);
     setShowPreview(true);
@@ -825,6 +909,7 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
       'Họ và Tên': r.name,
       'Điểm (Thang 10)': r.score.toFixed(1),
       'Số câu đúng': `${r.correctCount}/${r.totalQuestions || 16}`,
+      'Số lần mở Tab/Rời màn hình': r.tabSwitchCount || 0,
       'Phần/Chương ôn tập': r.chapter || 'Thi tổng hợp'
     }));
 
@@ -1052,10 +1137,10 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                       </button>
                       <button 
                         onClick={() => syncMetadata()}
-                        title="Đồng bộ Metadata (Tối ưu tải trang)"
-                        className="px-2.5 py-1.5 bg-slate-100 text-slate-500 rounded-lg hover:bg-blue-50 hover:text-blue-600 transition-all border border-transparent hover:border-blue-100 font-bold text-[10px] flex items-center gap-1.5"
+                        title="Đồng bộ Metadata & Mã hóa toàn bộ đáp án kho đề chống F12"
+                        className="px-2.5 py-1.5 bg-indigo-50 text-indigo-700 rounded-lg hover:bg-indigo-100 transition-all border border-indigo-200 font-bold text-[10px] flex items-center gap-1.5 shrink-0 cursor-pointer"
                       >
-                        <RefreshCw size={14} /> Đồng bộ
+                        <ShieldCheck size={14} /> Đồng bộ & Mã hóa Đáp án
                       </button>
                       <div className="flex bg-slate-100 p-0.5 rounded-lg shrink-0">
                         {['Tất cả', 'Số và Đại số', 'Hình học và Đo lường', 'Thống kê và Xác suất'].map(cat => (
@@ -1164,10 +1249,30 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                 {showAddForm && (
                   <div className="overflow-hidden">
                     <form onSubmit={handleAddQuestion} className="bg-white p-8 rounded-[2rem] border-2 border-blue-100 shadow-xl space-y-6">
+                      <MathEquationToolbar
+                        activeTarget={equationTarget}
+                        onTargetChange={setEquationTarget}
+                        onInsert={(latex, targetField) => {
+                          const target = targetField !== undefined ? targetField : equationTarget;
+                          if (target === 'content') {
+                            setNewQuestion(prev => ({
+                              ...prev,
+                              content: prev.content ? `${prev.content} ${latex}` : latex
+                            }));
+                          } else if (typeof target === 'number' && target >= 0 && target < 4) {
+                            setNewQuestion(prev => {
+                              const nextOpts = [...prev.options];
+                              nextOpts[target] = nextOpts[target] ? `${nextOpts[target]} ${latex}` : latex;
+                              return { ...prev, options: nextOpts };
+                            });
+                          }
+                        }}
+                      />
+
                       <div>
                       <div className="flex items-center justify-between mb-3 ml-1">
                         <label className="block text-xs font-black text-slate-400 uppercase tracking-widest">
-                          {editId ? 'Sửa câu hỏi' : 'Nội dung câu hỏi'} (LaTeX: $...$)
+                          {editId ? 'Sửa câu hỏi' : 'Nội dung câu hỏi'} (LaTeX: $...$ hoặc chọn công thức ở trên)
                         </label>
                         {editId && (
                           <button 
@@ -1182,17 +1287,48 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                           </button>
                         )}
                       </div>
-                        <textarea required className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl h-32 focus:ring-2 focus:ring-blue-500 outline-none text-lg font-medium" value={newQuestion.content} onChange={e => setNewQuestion({...newQuestion, content: e.target.value})} placeholder="Nhập câu hỏi..." />
+                        <textarea
+                          required
+                          onFocus={() => setEquationTarget('content')}
+                          className={`w-full p-4 bg-slate-50 border rounded-2xl h-32 focus:ring-2 focus:ring-blue-500 outline-none text-lg font-medium transition-all ${equationTarget === 'content' ? 'border-indigo-300 bg-indigo-50/20' : 'border-slate-100'}`}
+                          value={newQuestion.content}
+                          onChange={e => setNewQuestion({...newQuestion, content: e.target.value})}
+                          placeholder="Nhập câu hỏi hoặc nhấn vào thanh công thức Toán ở trên để chèn nhanh..."
+                        />
+                        {newQuestion.content.trim() && (
+                          <div className="mt-2 p-3.5 bg-blue-50/50 border border-blue-100 rounded-xl">
+                            <span className="block text-[10px] font-black text-blue-500 uppercase tracking-widest mb-1">Xem trước hiển thị câu hỏi:</span>
+                            <div className="text-base font-semibold text-slate-800 overflow-x-auto">
+                              <MathText text={newQuestion.content} />
+                            </div>
+                          </div>
+                        )}
                       </div>
-                      <div className="grid grid-cols-2 gap-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {newQuestion.options.map((opt, i) => (
-                          <div key={i} className="flex gap-3 items-center bg-slate-50 p-3 rounded-2xl border border-slate-100">
-                             <div className="w-8 h-8 rounded-lg bg-white border border-slate-200 flex items-center justify-center font-bold text-xs text-slate-400">{String.fromCharCode(65 + i)}</div>
-                             <input required type="text" className="flex-1 bg-transparent outline-none text-sm font-medium" value={opt} onChange={e => {
-                               const newOpts = [...newQuestion.options];
-                               newOpts[i] = e.target.value;
-                               setNewQuestion({...newQuestion, options: newOpts});
-                             }} placeholder={`Đáp án ${String.fromCharCode(65 + i)}`} />
+                          <div key={i} className="space-y-1.5">
+                            <div className={`flex gap-3 items-center bg-slate-50 p-3 rounded-2xl border transition-all ${equationTarget === i ? 'border-indigo-300 bg-indigo-50/20 ring-2 ring-indigo-100' : 'border-slate-100'}`}>
+                               <div className={`w-8 h-8 rounded-lg border flex items-center justify-center font-bold text-xs ${equationTarget === i ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-200 text-slate-400'}`}>{String.fromCharCode(65 + i)}</div>
+                               <input
+                                 required
+                                 type="text"
+                                 onFocus={() => setEquationTarget(i)}
+                                 className="flex-1 bg-transparent outline-none text-sm font-medium"
+                                 value={opt}
+                                 onChange={e => {
+                                   const newOpts = [...newQuestion.options];
+                                   newOpts[i] = e.target.value;
+                                   setNewQuestion({...newQuestion, options: newOpts});
+                                 }}
+                                 placeholder={`Đáp án ${String.fromCharCode(65 + i)}`}
+                               />
+                            </div>
+                            {opt.trim() && (
+                              <div className="px-3 py-1.5 bg-slate-50/80 border border-slate-100 rounded-xl text-xs text-slate-700 overflow-x-auto">
+                                <span className="font-bold text-slate-400 mr-1.5">{String.fromCharCode(65 + i)}.</span>
+                                <MathText text={opt} />
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1453,7 +1589,20 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
                                  </td>
                                  <td className="px-2"><span className="px-1.5 py-0 bg-blue-50 text-blue-600 text-[8px] font-black rounded uppercase">{r.class}</span></td>
                                  <td className="px-2"><span className="text-[9px] text-slate-500 font-bold uppercase">{r.school || 'N/A'}</span></td>
-                                 <td className="px-2 font-medium text-slate-800 text-[10px]">{r.name}</td><td className="px-2"><span className="text-[9px] text-slate-600 font-bold truncate max-w-[140px] inline-block font-sans" title={r.chapter || "Thi tổng hợp"}>{r.chapter ? r.chapter.split(". ")[0] : "Tổng hợp"}</span></td>
+                                 <td className="px-2 font-medium text-slate-800 text-[10px]">
+                                   <div className="flex items-center gap-1.5">
+                                     <span>{r.name}</span>
+                                     {(r.tabSwitchCount || 0) > 0 && (
+                                       <span
+                                         className="px-1.5 py-0.5 bg-rose-50 text-rose-600 border border-rose-200 rounded text-[8px] font-black"
+                                         title={`Học sinh đã chuyển tab hoặc mở cửa sổ khác ${r.tabSwitchCount} lần khi làm bài`}
+                                       >
+                                         ⚠️ Rời tab: {r.tabSwitchCount}
+                                       </span>
+                                     )}
+                                   </div>
+                                 </td>
+                                 <td className="px-2"><span className="text-[9px] text-slate-600 font-bold truncate max-w-[140px] inline-block font-sans" title={r.chapter || "Thi tổng hợp"}>{r.chapter ? r.chapter.split(". ")[0] : "Tổng hợp"}</span></td>
                                  <td className="pr-4 pl-2 text-right">
                                     <div className="flex flex-col items-end">
                                        <span className={`text-base font-black ${r.score >= 8.0 ? 'text-green-500' : r.score >= 5.0 ? 'text-blue-500' : 'text-orange-500'}`}>

@@ -1,10 +1,35 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { db, Question, QuizResult, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { db, Question, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, query, where, documentId, limit } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
-import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, Trophy, BookOpen, Award, Bookmark, ArrowRight, School, GraduationCap, Users, ChevronDown, Check, Sparkles } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert } from 'lucide-react';
 import MathText from './MathText';
-import { getRosterSuggestions, matchResultToRoster } from '../utils/nameMatcher';
+import { getRosterSuggestions, matchResultToRoster, removeVietnameseTones, cleanName } from '../utils/nameMatcher';
+import {
+  sanitizeQuestionForStudent,
+  resolveCorrectAnswerIndex,
+  isStudentAnswerCorrect,
+  encryptStudentChoice,
+  decryptStudentChoice,
+  encryptSessionCache
+} from '../utils/security';
+
+const STUDENT_PROFILE_STORAGE_KEY = 'quiz_student_profile_v1';
+const METADATA_CACHE_KEY = 'quiz_metadata_ids';
+const METADATA_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function normalizeChapterStr(str?: string | null): string {
+  if (!str) return '';
+  return str
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+    .replace(/\$/g, '')
+    .replace(/\\NEQ/g, '!=')
+    .replace(/\\NOT=/g, '!=')
+    .replace(/≠/g, '!=')
+    .replace(/\^2/g, '²');
+}
 
 export default function Quiz({ 
   onBack, 
@@ -17,21 +42,108 @@ export default function Quiz({
 }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [currentStep, setCurrentStep] = useState<'info' | 'select_chapter' | 'doing' | 'result' | 'review'>('info');
-  const [studentInfo, setStudentInfo] = useState({ name: '', class: '9A8', school: 'THCS Nam Cửa Việt' });
+  
+  const [studentInfo, setStudentInfo] = useState<{ name: string; class: string; school: string }>(() => {
+    try {
+      const saved = localStorage.getItem(STUDENT_PROFILE_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        const validSchool = parsed.school && SCHOOL_CLASSES[parsed.school] ? parsed.school : 'THCS Nam Cửa Việt';
+        const allowedClasses = SCHOOL_CLASSES[validSchool] || ['9A8', '9A9', 'Học thêm'];
+        const validClass = parsed.class && allowedClasses.includes(parsed.class) ? parsed.class : allowedClasses[0];
+        return {
+          name: typeof parsed.name === 'string' ? parsed.name : '',
+          school: validSchool,
+          class: validClass
+        };
+      }
+    } catch (e) {
+      // ignore storage errors
+    }
+    return { name: '', class: '9A8', school: 'THCS Nam Cửa Việt' };
+  });
+
   const [classRoster, setClassRoster] = useState<string[]>([]);
   const [isRosterLoading, setIsRosterLoading] = useState(false);
   const [showNameDropdown, setShowNameDropdown] = useState(false);
   const nameDropdownRef = useRef<HTMLDivElement>(null);
+
   const [selectedChapter, setSelectedChapter] = useState<string | null>(null);
-  const [userAnswers, setUserAnswers] = useState<Record<number, number>>({});
+  const [encryptedChoices, setEncryptedChoices] = useState<Record<number, string>>({});
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
   const [correctCount, setCorrectCount] = useState(0);
   const [startTime, setStartTime] = useState<Date | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [loadingQuestions, setLoadingQuestions] = useState(false);
   const [selectedPart, setSelectedPart] = useState<string>('');
   const [selectedChapDropdown, setSelectedChapDropdown] = useState<string>('');
+
+  // In-app notification & confirmation modal (replaces browser alert/confirm)
+  const [notice, setNotice] = useState<{ type: 'error' | 'info'; message: string } | null>(null);
+  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+
+  // Anti-tab-switch / New browser window proctoring state
+  const [tabSwitchCount, setTabSwitchCount] = useState(0);
+  const [showTabWarningModal, setShowTabWarningModal] = useState(false);
+  const [autoSubmittedByViolation, setAutoSubmittedByViolation] = useState(false);
+  const lastViolationTimeRef = useRef<number>(0);
+  const MAX_TAB_VIOLATIONS = 3;
+
+  const showToast = useCallback((message: string, type: 'error' | 'info' = 'error') => {
+    setNotice({ type, message });
+    setTimeout(() => {
+      setNotice(prev => (prev?.message === message ? null : prev));
+    }, 5000);
+  }, []);
+
+  const getStudentChoice = useCallback(
+    (qIdx: number): number | undefined => {
+      const token = encryptedChoices[qIdx];
+      if (!token) return undefined;
+      const q = questions[qIdx];
+      return decryptStudentChoice(token, qIdx, q?.id || q?.content || '');
+    },
+    [encryptedChoices, questions]
+  );
+
+  const selectStudentChoice = useCallback(
+    (qIdx: number, optIdx: number) => {
+      const q = questions[qIdx];
+      const token = encryptStudentChoice(qIdx, optIdx, q?.id || q?.content || '');
+      setEncryptedChoices(prev => ({ ...prev, [qIdx]: token }));
+    },
+    [questions]
+  );
+
+  // Save student profile on change (when not in quick practice)
+  useEffect(() => {
+    if (!isQuickPractice && studentInfo.school && studentInfo.class) {
+      try {
+        localStorage.setItem(STUDENT_PROFILE_STORAGE_KEY, JSON.stringify(studentInfo));
+      } catch (e) {
+        // ignore
+      }
+    }
+  }, [studentInfo, isQuickPractice]);
+
+  // Live timer during quiz
+  useEffect(() => {
+    if (currentStep !== 'doing' || !startTime) {
+      return;
+    }
+    const interval = setInterval(() => {
+      setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startTime.getTime()) / 1000)));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [currentStep, startTime]);
+
+  const formatDuration = (secs: number) => {
+    const mins = Math.floor(secs / 60);
+    const rem = secs % 60;
+    return `${mins.toString().padStart(2, '0')}:${rem.toString().padStart(2, '0')}`;
+  };
 
   // Close name dropdown when clicking outside
   useEffect(() => {
@@ -44,33 +156,54 @@ export default function Quiz({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Fetch class roster dynamically whenever school or class changes
+  // Fetch class roster dynamically whenever school or class changes (with sessionStorage cache)
   useEffect(() => {
-    if (!studentInfo.school || !studentInfo.class) {
+    if (isQuickPractice || !studentInfo.school || !studentInfo.class) {
       setClassRoster([]);
       return;
     }
 
     let isMounted = true;
+    const rosterDocId = `roster_${studentInfo.school.trim().replace(/\s+/g, '_')}_${studentInfo.class.trim().replace(/\s+/g, '_')}`;
+    const cacheKey = `cached_${rosterDocId}`;
+
     const fetchRoster = async () => {
+      // Check session cache first to save Firestore reads
+      try {
+        const cached = sessionStorage.getItem(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setClassRoster(parsed);
+            return;
+          }
+        }
+      } catch (e) {
+        // ignore cache error
+      }
+
       setIsRosterLoading(true);
       try {
-        const rosterDocId = `roster_${studentInfo.school.trim().replace(/\s+/g, '_')}_${studentInfo.class.trim().replace(/\s+/g, '_')}`;
         const rosterSnap = await getDoc(doc(db, 'class_rosters', rosterDocId));
 
         if (rosterSnap.exists()) {
           const data = rosterSnap.data() as ClassRoster;
           if (isMounted && data.students && data.students.length > 0) {
-            setClassRoster(data.students.sort((a, b) => a.localeCompare(b, 'vi')));
+            const sorted = [...data.students].sort((a, b) => a.localeCompare(b, 'vi'));
+            setClassRoster(sorted);
+            try {
+              sessionStorage.setItem(cacheKey, JSON.stringify(sorted));
+            } catch (e) {}
             setIsRosterLoading(false);
             return;
           }
         }
 
-        // Fallback: Query results for past students from this school & class
+        // Lightweight Fallback: Query at most 60 recent results for this class
         const q = query(
           collection(db, 'results'),
-          where('class', '==', studentInfo.class)
+          where('class', '==', studentInfo.class),
+          limit(60)
         );
         const resultsSnap = await getDocs(q);
         const fetchedResults = resultsSnap.docs
@@ -78,10 +211,15 @@ export default function Quiz({
           .filter(r => !studentInfo.school || r.school === studentInfo.school || !r.school);
         const distinctNames = Array.from<string>(
           new Set(fetchedResults.map(r => (r.name || '').trim()).filter(Boolean))
-        );
+        ).sort((a, b) => a.localeCompare(b, 'vi'));
 
         if (isMounted) {
-          setClassRoster(distinctNames.sort((a, b) => a.localeCompare(b, 'vi')));
+          setClassRoster(distinctNames);
+          if (distinctNames.length > 0) {
+            try {
+              sessionStorage.setItem(cacheKey, JSON.stringify(distinctNames));
+            } catch (e) {}
+          }
         }
       } catch (err) {
         console.error('Error loading class roster:', err);
@@ -94,15 +232,15 @@ export default function Quiz({
     return () => {
       isMounted = false;
     };
-  }, [studentInfo.school, studentInfo.class]);
+  }, [studentInfo.school, studentInfo.class, isQuickPractice]);
 
   const fetchAndRandomize = async (chap?: string, isPractice = false) => {
     setLoadingQuestions(true);
+    setNotice(null);
     try {
-      // Clear previous cached session questions
       sessionStorage.removeItem('quiz_current_questions_session');
 
-      const shuffle = (array: any[]) => {
+      const shuffle = <T,>(array: T[]): T[] => {
         const arr = [...array];
         for (let i = arr.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
@@ -111,149 +249,108 @@ export default function Quiz({
         return arr;
       };
 
+      const fetchByIds = async (ids: string[]): Promise<Question[]> => {
+        const result: Question[] = [];
+        const chunks: string[][] = [];
+        for (let i = 0; i < ids.length; i += 10) {
+          chunks.push(ids.slice(i, i + 10));
+        }
+        for (const chunk of chunks) {
+          if (chunk.length === 0) continue;
+          const q = query(collection(db, 'questions'), where(documentId(), 'in', chunk));
+          try {
+            const snapshot = await getDocs(q);
+            result.push(...snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question)));
+          } catch (e) {
+            handleFirestoreError(e, OperationType.GET, 'questions');
+          }
+        }
+        return result;
+      };
+
+      // Load metadata with TTL validation
+      const loadMetadataLists = async (forceRefresh = false): Promise<{ id: string; chapter: string; category: string }[]> => {
+        let lists: any = null;
+        if (!forceRefresh) {
+          const cached = localStorage.getItem(METADATA_CACHE_KEY);
+          if (cached) {
+            try {
+              const { data, timestamp } = JSON.parse(cached);
+              if (timestamp && Date.now() - timestamp < METADATA_TTL_MS) {
+                lists = data;
+              } else {
+                localStorage.removeItem(METADATA_CACHE_KEY);
+              }
+            } catch (e) {
+              localStorage.removeItem(METADATA_CACHE_KEY);
+            }
+          }
+        }
+
+        if (!lists) {
+          try {
+            const metaDoc = await getDoc(doc(db, 'metadata', 'questions'));
+            if (metaDoc.exists()) {
+              lists = metaDoc.data();
+              localStorage.setItem(METADATA_CACHE_KEY, JSON.stringify({ data: lists, timestamp: Date.now() }));
+            }
+          } catch (e) {
+            handleFirestoreError(e, OperationType.GET, 'metadata/questions');
+          }
+        }
+
+        return lists && Array.isArray(lists.allQuestions) ? lists.allQuestions : [];
+      };
+
+      let allQsMetaData = await loadMetadataLists(false);
       let finalQuestions: Question[] = [];
 
-      // 1. Cố gắng lấy danh mục câu hỏi (ID, chương, phân môn) từ metadata để tiết kiệm lượt đọc
-      let allQsMetaData: { id: string; chapter: string; category: string }[] = [];
-      const CACHE_KEY = 'quiz_metadata_ids';
-      let lists: any = null;
-      
-      const cached = localStorage.getItem(CACHE_KEY);
-      if (cached) {
-        try {
-          const { data } = JSON.parse(cached);
-          lists = data;
-        } catch (e) {
-          localStorage.removeItem(CACHE_KEY);
-        }
-      }
+      if (isPractice || chap) {
+        const targetChap = isPractice ? (chap && chap !== 'all' ? chap : null) : chap;
+        const targetNorm = normalizeChapterStr(targetChap);
 
-      if (!lists) {
-        try {
-          const metaDoc = await getDoc(doc(db, 'metadata', 'questions'));
-          if (metaDoc.exists()) {
-            lists = metaDoc.data();
-            localStorage.setItem(CACHE_KEY, JSON.stringify({ data: lists, timestamp: Date.now() }));
-          }
-        } catch (e) {
-          handleFirestoreError(e, OperationType.GET, 'metadata/questions');
-        }
-      }
+        const pickFromMeta = (metaList: { id: string; chapter: string; category: string }[]) => {
+          const filtered = targetNorm
+            ? metaList.filter(q => normalizeChapterStr(q.chapter) === targetNorm)
+            : metaList;
+          return shuffle(filtered.map(q => q.id).filter(Boolean)).slice(0, 16);
+        };
 
-      if (lists && lists.allQuestions && lists.allQuestions.length > 0) {
-        allQsMetaData = lists.allQuestions;
-      }
+        let selectedIds = pickFromMeta(allQsMetaData);
+        let fetchedQs = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
 
-      if (isPractice) {
-        // Mode Quick Practice: Lấy ngẫu nhiên đúng 16 câu hỏi từ metadata
-        let selectedIds: string[] = [];
-        if (allQsMetaData.length > 0) {
-          const filteredMeta = chap && chap !== 'all'
-            ? allQsMetaData.filter(q => q.chapter?.trim() === chap.trim())
-            : allQsMetaData;
-          
-          selectedIds = shuffle(filteredMeta.map(q => q.id)).slice(0, 16);
+        // If cached metadata had stale IDs, refresh metadata once
+        if (selectedIds.length > 0 && fetchedQs.length < Math.min(selectedIds.length, 16)) {
+          allQsMetaData = await loadMetadataLists(true);
+          selectedIds = pickFromMeta(allQsMetaData);
+          fetchedQs = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
         }
 
-        let practiceQs: Question[] = [];
-        if (selectedIds.length > 0) {
-          // Lấy đúng 16 câu hỏi chi tiết qua một câu truy vấn duy nhất hoặc chia chunks vì 'in' tối đa 10 phần tử
-          const chunks = [];
-          for(let i = 0; i < selectedIds.length; i += 10) {
-              chunks.push(selectedIds.slice(i, i + 10));
-          }
-          for (const chunk of chunks) {
-             if(chunk.length === 0) continue;
-             const q = query(collection(db, 'questions'), where(documentId(), 'in', chunk));
-             try {
-               const snapshot = await getDocs(q);
-               practiceQs = practiceQs.concat(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question)));
-             } catch (e) {
-               handleFirestoreError(e, OperationType.GET, 'questions');
-             }
-          }
-        }
-
-        // Fallback: Nếu không có metadata/cache, tải trực tiếp bằng query theo chương (nếu chap specified) hoặc limit 40 chọn 16 câu
-        if (practiceQs.length === 0) {
-          console.log("Fallback: Tải ngẫu nhiên 16 câu từ questions...");
+        // Fallback: Direct Firestore query if metadata didn't return questions
+        if (fetchedQs.length === 0) {
           try {
             let snapshot;
-            if (chap && chap !== 'all') {
-              snapshot = await getDocs(query(collection(db, 'questions'), where('chapter', '==', chap), limit(40)));
+            if (targetChap) {
+              snapshot = await getDocs(query(collection(db, 'questions'), where('chapter', '==', targetChap), limit(40)));
             } else {
               snapshot = await getDocs(query(collection(db, 'questions'), limit(40)));
             }
-            const allFetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question));
-            practiceQs = shuffle(allFetched).slice(0, 16);
+            const allFetched: Question[] = snapshot.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
+            fetchedQs = shuffle(allFetched).slice(0, 16);
           } catch (e) {
             handleFirestoreError(e, OperationType.GET, 'questions');
           }
         }
 
-        if (practiceQs.length === 0) {
-          alert('Chương học được chọn hoặc Ngân hàng đề hiện chưa có câu hỏi để luyện tập.');
+        if (fetchedQs.length === 0) {
+          showToast('Chương học được chọn hiện chưa có câu hỏi trong ngân hàng đề. Vui lòng chọn chương khác!');
           setLoadingQuestions(false);
           return false;
         }
 
-        finalQuestions = shuffle(practiceQs);
-      } else if (chap) {
-        // Mode A: selective review by chapter - Cực kỳ tối ưu nhờ metadata quét đúng ID
-        console.log(`Getting optimized questions for chapter: ${chap}`);
-        let selectedIds: string[] = [];
-
-        if (allQsMetaData.length > 0) {
-          // Lọc các ID câu hỏi thuộc chương được chọn
-          const chapQsMeta = allQsMetaData.filter(q => q.chapter?.trim() === chap.trim());
-          if (chapQsMeta.length > 0) {
-            selectedIds = shuffle(chapQsMeta.map(q => q.id)).slice(0, 16);
-          }
-        }
-
-        let chapQsDetail: Question[] = [];
-
-        // Nếu tìm được IDs chi tiết từ Metadata, ta chỉ tải đúng tối đa 16 câu hỏi đó
-        if (selectedIds.length > 0) {
-          const chunks = [];
-          for(let i = 0; i < selectedIds.length; i += 10) {
-              chunks.push(selectedIds.slice(i, i + 10));
-          }
-          
-          for (const chunk of chunks) {
-             if(chunk.length === 0) continue;
-             const q = query(collection(db, 'questions'), where(documentId(), 'in', chunk));
-             try {
-               const snapshot = await getDocs(q);
-               chapQsDetail = chapQsDetail.concat(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question)));
-             } catch (e) {
-               handleFirestoreError(e, OperationType.GET, 'questions');
-             }
-          }
-        }
-
-        // Fallback an toàn: nếu metadata trống hoặc không tìm thấy câu hỏi tương ứng, tải trực tiếp bằng query 'where' theo chương
-        if (chapQsDetail.length === 0) {
-          console.log("Fallback: Querying chapter directly...");
-          const qChap = query(collection(db, 'questions'), where('chapter', '==', chap));
-          try {
-            const chapSnapshot = await getDocs(qChap);
-            chapQsDetail = chapSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
-          } catch (e) {
-            handleFirestoreError(e, OperationType.GET, 'questions');
-          }
-        }
-        
-        if (chapQsDetail.length === 0) {
-          alert(`Chương này hiện chưa có câu hỏi trong ngân hàng đề. Vui lòng chọn chương khác.`);
-          setLoadingQuestions(false);
-          return false;
-        }
-
-        // Trộn ngẫu nhiên câu hỏi của chương
-        finalQuestions = shuffle(chapQsDetail).slice(0, 16);
+        finalQuestions = shuffle(fetchedQs).slice(0, 16);
       } else {
-        // Mode B: standard mock exam phân bổ đúng tỷ lệ theo chương học (Tổng cộng 16 câu)
+        // Mode B: Standard comprehensive exam (16 questions distributed across chapters)
         const chapterQuotas: Record<string, number> = {
           'Chương I. PHƯƠNG TRÌNH VÀ HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN': 2,
           'Chương II. PHƯƠNG TRÌNH VÀ BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN': 2,
@@ -267,154 +364,85 @@ export default function Quiz({
           'Chương VIII. XÁC SUẤT CỦA BIẾN CỐ TRONG MỘT SỐ MÔ HÌNH XÁC SUẤT ĐƠN GIẢN': 1
         };
 
-        const getNormalizedKey = (chName: string): string | null => {
-          if (!chName) return null;
-          const clean = chName.trim().toUpperCase()
-            .replace(/\s+/g, ' ')
-            .replace(/\$/g, '')
-            .replace(/\\NEQ/g, '≠')
-            .replace(/\\NOT=/g, '≠')
-            .replace(/≠/g, '!=')
-            .replace(/\^2/g, '²');
-          
+        const getNormalizedKey = (chName?: string): string | null => {
+          const clean = normalizeChapterStr(chName);
+          if (!clean) return null;
           for (const key of Object.keys(chapterQuotas)) {
-            const keyClean = key.trim().toUpperCase()
-              .replace(/\s+/g, ' ')
-              .replace(/\$/g, '')
-              .replace(/\\NEQ/g, '≠')
-              .replace(/\\NOT=/g, '≠')
-              .replace(/≠/g, '!=')
-              .replace(/\^2/g, '²');
-            if (clean === keyClean) {
+            if (clean === normalizeChapterStr(key)) {
               return key;
             }
           }
           return null;
         };
 
-        let selectedIds: string[] = [];
-        
-        if (allQsMetaData.length > 0) {
-          // Gom các câu hỏi theo chương tương ứng dựa trên dữ liệu metadata gọn nhẹ
+        const selectQuotaIds = (metaList: { id: string; chapter: string; category: string }[]) => {
           const questionsByChapter: Record<string, { id: string; chapter: string; category: string }[]> = {};
-          allQsMetaData.forEach(q => {
-            const chName = q.chapter ? q.chapter.trim() : '';
-            if (chName) {
-              const matchedKey = getNormalizedKey(chName);
-              if (matchedKey) {
-                if (!questionsByChapter[matchedKey]) {
-                  questionsByChapter[matchedKey] = [];
-                }
-                questionsByChapter[matchedKey].push(q);
-              }
+          metaList.forEach(q => {
+            const matchedKey = getNormalizedKey(q.chapter);
+            if (matchedKey) {
+              if (!questionsByChapter[matchedKey]) questionsByChapter[matchedKey] = [];
+              questionsByChapter[matchedKey].push(q);
             }
           });
 
+          const chosenIds: string[] = [];
           const usedIds = new Set<string>();
 
-          // Chọn theo đúng quota của từng chương
           Object.keys(chapterQuotas).forEach(ch => {
             const quota = chapterQuotas[ch];
             const chQs = shuffle(questionsByChapter[ch] || []);
-            const chosen = chQs.slice(0, quota);
-            chosen.forEach(q => {
+            chQs.slice(0, quota).forEach(q => {
               if (q.id) {
-                selectedIds.push(q.id);
+                chosenIds.push(q.id);
                 usedIds.add(q.id);
               }
             });
           });
 
-          // Nếu tổng lượng câu hỏi chưa đủ 16, bù thêm bằng các ID còn lại
-          if (selectedIds.length < 16) {
-            const remainingQs = allQsMetaData.filter(q => q.id && !usedIds.has(q.id));
-            const fillQs = shuffle(remainingQs).slice(0, 16 - selectedIds.length);
-            fillQs.forEach(q => {
-              selectedIds.push(q.id);
-            });
+          if (chosenIds.length < 16) {
+            const remainingQs = metaList.filter(q => q.id && !usedIds.has(q.id));
+            shuffle(remainingQs)
+              .slice(0, 16 - chosenIds.length)
+              .forEach(q => chosenIds.push(q.id));
           }
+          return chosenIds;
+        };
+
+        let selectedIds = allQsMetaData.length > 0 ? selectQuotaIds(allQsMetaData) : [];
+        let allSelected = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
+
+        // If some IDs were stale/deleted in cache, refresh metadata once
+        if (selectedIds.length > 0 && allSelected.length < Math.min(selectedIds.length, 16)) {
+          allQsMetaData = await loadMetadataLists(true);
+          selectedIds = selectQuotaIds(allQsMetaData);
+          allSelected = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
         }
 
-        // 2. Truy vấn chi tiết đúng 16 câu hỏi đã chọn qua IN query (Tối ưu tuyệt đối)
-        let allSelected: Question[] = [];
-        if (selectedIds.length > 0) {
-          const chunks = [];
-          for(let i = 0; i < selectedIds.length; i += 10) {
-              chunks.push(selectedIds.slice(i, i + 10));
-          }
-          
-          for (const chunk of chunks) {
-             if(chunk.length === 0) continue;
-             const q = query(collection(db, 'questions'), where(documentId(), 'in', chunk));
-             try {
-               const snapshot = await getDocs(q);
-               allSelected = allSelected.concat(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question)));
-             } catch (e) {
-               handleFirestoreError(e, OperationType.GET, 'questions');
-             }
-          }
-        }
-
-        // Fallback: nếu rỗng (ví dụ chưa có metadata), tải toàn bộ câu hỏi (An toàn)
+        // Fallback if metadata was empty
         if (allSelected.length === 0) {
           let allQs: Question[] = [];
           try {
-            const snapshot = await getDocs(collection(db, 'questions'));
-            allQs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Question));
+            const snapshot = await getDocs(query(collection(db, 'questions'), limit(80)));
+            allQs = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Question));
           } catch (e) {
             handleFirestoreError(e, OperationType.GET, 'questions');
           }
 
           if (allQs.length === 0) {
-            throw new Error("Ngân hàng câu hỏi trống.");
+            showToast('Ngân hàng câu hỏi hiện đang trống.');
+            setLoadingQuestions(false);
+            return false;
           }
 
-          const questionsByChapter: Record<string, Question[]> = {};
-          allQs.forEach(q => {
-            const chName = q.chapter ? q.chapter.trim() : '';
-            if (chName) {
-              const matchedKey = getNormalizedKey(chName);
-              if (matchedKey) {
-                if (!questionsByChapter[matchedKey]) {
-                  questionsByChapter[matchedKey] = [];
-                }
-                questionsByChapter[matchedKey].push(q);
-              }
-            }
-          });
-
-          const selectedQs: Question[] = [];
-          const usedIds = new Set<string>();
-
-          // Chọn theo đúng quota
-          Object.keys(chapterQuotas).forEach(ch => {
-            const quota = chapterQuotas[ch];
-            const chQs = shuffle(questionsByChapter[ch] || []);
-            const chosen = chQs.slice(0, quota);
-            chosen.forEach(q => {
-              if (q.id) {
-                selectedQs.push(q);
-                usedIds.add(q.id);
-              }
-            });
-          });
-
-          if (selectedQs.length < 16) {
-            const remainingQs = allQs.filter(q => q.id && !usedIds.has(q.id));
-            const fillQs = shuffle(remainingQs).slice(0, 16 - selectedQs.length);
-            fillQs.forEach(q => {
-              selectedQs.push(q);
-            });
-          }
-
-          allSelected = selectedQs;
+          allSelected = shuffle(allQs).slice(0, 16);
         }
 
         finalQuestions = shuffle(allSelected);
       }
 
-      setQuestions(finalQuestions);
-      sessionStorage.setItem('quiz_current_questions_session', JSON.stringify(finalQuestions));
+      const securedQuestions = finalQuestions.map(q => sanitizeQuestionForStudent(q));
+      setQuestions(securedQuestions);
+      sessionStorage.setItem('quiz_current_questions_session', encryptSessionCache(securedQuestions));
       setLoadingQuestions(false);
       return true;
     } catch (error) {
@@ -422,9 +450,9 @@ export default function Quiz({
       setLoadingQuestions(false);
       const isQuotaError = (error as any)?.message?.toLowerCase().includes('quota') || (error as any)?.code === 'resource-exhausted';
       if (isQuotaError) {
-        alert("Hệ thống đã hết dung lượng hôm nay, hẹn bạn vào lại lúc 14 h nhé");
+        showToast("Hệ thống đã hết dung lượng đọc miễn phí hôm nay, hẹn bạn vào lại sau nhé!");
       } else {
-        alert("Lỗi khi tải câu hỏi: " + (error as Error).message);
+        showToast("Lỗi khi tải câu hỏi: " + (error as Error).message);
       }
       return false;
     }
@@ -443,6 +471,7 @@ export default function Quiz({
         const success = await fetchAndRandomize(quickPracticeChapter, true);
         if (success) {
           setStartTime(new Date());
+          setElapsedSeconds(0);
           setCurrentStep('doing');
         }
       };
@@ -451,51 +480,87 @@ export default function Quiz({
   }, [isQuickPractice, quickPracticeChapter]);
 
   const startQuiz = async (chap?: string) => {
-    if (!studentInfo.name || !studentInfo.class || !studentInfo.school) {
-      alert('Vui lòng nhập đầy đủ thông tin');
+    const cleanedInputName = cleanName(studentInfo.name);
+    if (!cleanedInputName || !studentInfo.class || !studentInfo.school) {
+      showToast('Vui lòng nhập đầy đủ Họ và Tên, Trường, Lớp!');
       return;
     }
+
+    // Auto-canonicalize student name if it matches a class roster entry without tones or case
+    let canonicalName = cleanedInputName;
+    if (classRoster.length > 0) {
+      const exactOrToneMatch = classRoster.find(
+        r => removeVietnameseTones(r) === removeVietnameseTones(cleanedInputName)
+      );
+      if (exactOrToneMatch) {
+        canonicalName = exactOrToneMatch;
+      }
+    }
+
+    if (canonicalName !== studentInfo.name) {
+      setStudentInfo(prev => ({ ...prev, name: canonicalName }));
+    }
+
     const chapName = chap || null;
     setSelectedChapter(chapName);
     
-    const success = await fetchAndRandomize(chap);
+    const success = await fetchAndRandomize(chap, false);
     if (success) {
+      setTabSwitchCount(0);
+      setShowTabWarningModal(false);
+      setAutoSubmittedByViolation(false);
       setStartTime(new Date());
+      setElapsedSeconds(0);
       setCurrentStep('doing');
     }
   };
 
-  const handleSubmit = async () => {
-    if (Object.keys(userAnswers).length < questions.length) {
-      if (!confirm('Bạn chưa hoàn thành tất cả câu hỏi. Nộp bài ngay?')) return;
-    }
-
+  const executeSubmit = useCallback(async (overrideTabSwitchCount?: number) => {
+    setShowSubmitConfirm(false);
+    setShowTabWarningModal(false);
     setIsSubmitting(true);
     let count = 0;
+    const encryptedAuditTokens: string[] = [];
+
     questions.forEach((q, i) => {
-      if (userAnswers[i] === q.correctAnswer) {
+      const chosenIdx = getStudentChoice(i);
+      if (isStudentAnswerCorrect(q, chosenIdx)) {
         count++;
+      }
+      if (chosenIdx !== undefined) {
+        encryptedAuditTokens.push(encryptStudentChoice(i, chosenIdx, q.id || ''));
       }
     });
 
-    // Tính điểm trên thang 10 dựa trên số câu thực tế (Làm tròn 1 chữ số thập phân)
     const finalScore = questions.length > 0 ? Math.round(((count / questions.length) * 10) * 10) / 10 : 0;
+    const finalViolations = typeof overrideTabSwitchCount === 'number' ? overrideTabSwitchCount : tabSwitchCount;
     setCorrectCount(count);
     setScore(finalScore);
 
     if (isQuickPractice) {
       setCurrentStep('result');
     } else {
+      // Ensure canonical name if matched in roster
+      let finalName = cleanName(studentInfo.name);
+      if (classRoster.length > 0) {
+        const matched = matchResultToRoster(finalName, classRoster);
+        if (matched && removeVietnameseTones(matched) === removeVietnameseTones(finalName)) {
+          finalName = matched;
+        }
+      }
+
       try {
         await addDoc(collection(db, 'results'), {
-          name: studentInfo.name,
+          name: finalName,
           class: studentInfo.class,
           school: studentInfo.school,
           score: finalScore,
           correctCount: count,
           totalQuestions: questions.length,
           chapter: selectedChapter || 'Tổng hợp',
-          startTime: Timestamp.fromDate(startTime!),
+          encryptedAnswers: encryptedAuditTokens.join('.'),
+          tabSwitchCount: finalViolations,
+          startTime: Timestamp.fromDate(startTime || new Date()),
           submittedAt: serverTimestamp()
         });
         setCurrentStep('result');
@@ -504,7 +569,140 @@ export default function Quiz({
       }
     }
     setIsSubmitting(false);
+  }, [questions, getStudentChoice, tabSwitchCount, isQuickPractice, studentInfo, classRoster, selectedChapter, startTime]);
+
+  const handleRequestSubmit = () => {
+    const answeredCount = questions.filter((_, idx) => getStudentChoice(idx) !== undefined).length;
+    if (answeredCount < questions.length) {
+      setShowSubmitConfirm(true);
+      return;
+    }
+    executeSubmit();
   };
+
+  // Keyboard shortcuts & Anti-F12 / Anti-DevTools protection during active quiz
+  useEffect(() => {
+    if (currentStep !== 'doing' && currentStep !== 'review') return;
+    const isReview = currentStep === 'review';
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Block F12, Ctrl+Shift+I/J/C, Ctrl+U, Ctrl+T, Ctrl+N, Ctrl+C during active exam
+      if (!isReview) {
+        const keyUpper = e.key.toUpperCase();
+        const isDevToolsOrNewTabShortcut =
+          e.key === 'F12' ||
+          ((e.ctrlKey || e.metaKey) && e.shiftKey && ['I', 'J', 'C', 'K', 'N', 'T'].includes(keyUpper)) ||
+          ((e.ctrlKey || e.metaKey) && ['U', 'T', 'N', 'C', 'S', 'P'].includes(keyUpper));
+
+        if (isDevToolsOrNewTabShortcut) {
+          e.preventDefault();
+          e.stopPropagation();
+          showToast('Chế độ bảo mật phòng thi: Chức năng mở tab mới, sao chép hoặc kiểm tra mã nguồn bị khóa khi đang thi!', 'info');
+          return;
+        }
+      }
+
+      if (showSubmitConfirm || showTabWarningModal) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) {
+        return;
+      }
+
+      if (e.key === 'ArrowLeft' && currentIndex > 0) {
+        e.preventDefault();
+        setCurrentIndex(prev => prev - 1);
+      } else if (e.key === 'ArrowRight' && currentIndex < questions.length - 1) {
+        e.preventDefault();
+        setCurrentIndex(prev => prev + 1);
+      } else if (!isReview) {
+        const keyUpper = e.key.toUpperCase();
+        const optionMap: Record<string, number> = {
+          '1': 0, 'A': 0,
+          '2': 1, 'B': 1,
+          '3': 2, 'C': 2,
+          '4': 3, 'D': 3
+        };
+        if (optionMap[keyUpper] !== undefined && questions[currentIndex]?.options[optionMap[keyUpper]] !== undefined) {
+          selectStudentChoice(currentIndex, optionMap[keyUpper]);
+        }
+      }
+    };
+
+    const handleContextMenu = (e: MouseEvent) => {
+      if (!isReview) {
+        e.preventDefault();
+      }
+    };
+
+    const handleCopyOrCut = (e: ClipboardEvent) => {
+      if (!isReview) {
+        e.preventDefault();
+        showToast('Không được phép sao chép nội dung đề thi để tra cứu bên ngoài!', 'info');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    window.addEventListener('contextmenu', handleContextMenu);
+    window.addEventListener('copy', handleCopyOrCut);
+    window.addEventListener('cut', handleCopyOrCut);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true);
+      window.removeEventListener('contextmenu', handleContextMenu);
+      window.removeEventListener('copy', handleCopyOrCut);
+      window.removeEventListener('cut', handleCopyOrCut);
+    };
+  }, [currentStep, currentIndex, questions, showSubmitConfirm, showTabWarningModal, selectStudentChoice, showToast]);
+
+  // Anti-Tab-Switch & Anti-New-Browser-Window Proctoring Detector
+  useEffect(() => {
+    if (currentStep !== 'doing' || isSubmitting) return;
+
+    const recordTabOrWindowViolation = () => {
+      const now = Date.now();
+      // Cooldown 1.5s so visibilitychange + blur firing together only counts as 1 switch
+      if (now - lastViolationTimeRef.current < 1500) return;
+      lastViolationTimeRef.current = now;
+
+      setTabSwitchCount(prev => {
+        const nextCount = prev + 1;
+        if (nextCount >= MAX_TAB_VIOLATIONS) {
+          setAutoSubmittedByViolation(true);
+          executeSubmit(nextCount);
+        } else {
+          setShowTabWarningModal(true);
+        }
+        return nextCount;
+      });
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        recordTabOrWindowViolation();
+      }
+    };
+
+    const handleWindowBlur = () => {
+      // Trigger when user switches to another browser window, opens a new tab/window, or uses Alt+Tab
+      if (document.hasFocus && !document.hasFocus()) {
+        recordTabOrWindowViolation();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('blur', handleWindowBlur);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
+  }, [currentStep, isSubmitting, executeSubmit]);
+
+  // Smart roster match suggestion for current input
+  const smartMatchedName = React.useMemo(() => {
+    const trimmed = cleanName(studentInfo.name);
+    if (!trimmed || classRoster.length === 0) return null;
+    if (classRoster.includes(trimmed)) return trimmed;
+    return matchResultToRoster(trimmed, classRoster);
+  }, [studentInfo.name, classRoster]);
 
   if (currentStep === 'info') {
     if (loadingQuestions) {
@@ -526,11 +724,28 @@ export default function Quiz({
       );
     }
 
+    const suggestions = getRosterSuggestions(studentInfo.name, classRoster);
+    const isExactInRoster = classRoster.includes(cleanName(studentInfo.name));
+
     return (
       <div className="max-w-md mx-auto mt-1 md:mt-3 p-4 md:p-8 bg-white rounded-[1.5rem] md:rounded-[2rem] shadow-2xl shadow-slate-200 border border-white">
+        {notice && (
+          <div className={`mb-4 p-3 rounded-xl border flex items-center justify-between gap-2 text-xs font-bold animate-in fade-in duration-150 ${
+            notice.type === 'error' ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-blue-50 text-blue-700 border-blue-200'
+          }`}>
+            <div className="flex items-center gap-2">
+              <AlertCircle size={15} className="shrink-0" />
+              <span>{notice.message}</span>
+            </div>
+            <button onClick={() => setNotice(null)} className="text-slate-400 hover:text-slate-600">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+
         <div className="text-center mb-2 md:mb-4">
           <div className="flex justify-between items-start mb-2 md:mb-4">
-            <button onClick={onBack} className="text-slate-400 hover:text-slate-600 transition-colors">
+            <button onClick={onBack} className="text-slate-400 hover:text-slate-600 transition-colors cursor-pointer">
               <ChevronLeft size={20} />
             </button>
             <div className="w-12 h-12 md:w-16 md:h-16 bg-blue-50 text-blue-600 rounded-xl md:rounded-2xl flex items-center justify-center shadow-inner">
@@ -541,8 +756,9 @@ export default function Quiz({
           <h2 className="text-xl md:text-2xl font-black text-slate-800">Thông tin học sinh</h2>
           <p className="text-[10px] md:text-sm text-slate-400 mt-1 font-semibold italic">Nhập thông tin đề thi & vào làm ngay</p>
         </div>
+
         <div className="space-y-3 md:space-y-4">
-          {/* Trường & Lớp (Đặt lên trước để danh sách học sinh theo lớp hiển thị chuẩn xác) */}
+          {/* Trường & Lớp */}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1 flex items-center gap-1">
@@ -621,7 +837,7 @@ export default function Quiz({
               <input 
                 type="text" 
                 className={`w-full p-2.5 md:p-3.5 bg-slate-50 border rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold pr-10 ${
-                  classRoster.includes(studentInfo.name.trim()) 
+                  isExactInRoster 
                     ? 'border-emerald-300 bg-emerald-50/30' 
                     : 'border-slate-200'
                 }`}
@@ -636,12 +852,11 @@ export default function Quiz({
                 }}
               />
               
-              {/* Nút bật tắt dropdown menu */}
               <button
                 type="button"
                 tabIndex={-1}
                 onClick={() => setShowNameDropdown(!showNameDropdown)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-blue-600 rounded-lg hover:bg-slate-100 transition-colors"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-blue-600 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
                 title="Bấm để mở danh sách học sinh lớp"
               >
                 {isRosterLoading ? (
@@ -652,18 +867,35 @@ export default function Quiz({
               </button>
             </div>
 
-            {/* Trạng thái xác nhận tên */}
-            {studentInfo.name && (
-              <div className="mt-1 flex items-center justify-between text-[11px] px-1">
-                {classRoster.includes(studentInfo.name.trim()) ? (
+            {/* Trạng thái xác nhận tên & Gợi ý chuẩn hóa thông minh */}
+            {studentInfo.name.trim() && (
+              <div className="mt-1.5 flex flex-col gap-1 text-[11px] px-1">
+                {isExactInRoster ? (
                   <span className="text-emerald-700 font-bold flex items-center gap-1">
-                    <CheckCircle2 size={13} className="text-emerald-600" />
+                    <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
                     Đúng tên trong danh sách lớp {studentInfo.class}
                   </span>
+                ) : smartMatchedName ? (
+                  <div className="flex items-center justify-between bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1 text-amber-800">
+                    <span className="flex items-center gap-1 font-medium truncate">
+                      <Sparkles size={12} className="text-amber-600 shrink-0" />
+                      <span>Có phải bạn là: <strong className="font-black text-amber-950">{smartMatchedName}</strong>?</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStudentInfo({ ...studentInfo, name: smartMatchedName });
+                        setShowNameDropdown(false);
+                      }}
+                      className="ml-2 px-2 py-0.5 bg-amber-600 text-white rounded text-[10px] font-black hover:bg-amber-700 transition shrink-0 cursor-pointer"
+                    >
+                      Chọn đúng tên
+                    </button>
+                  </div>
                 ) : classRoster.length > 0 ? (
                   <span className="text-amber-600 font-medium flex items-center gap-1">
-                    <Sparkles size={12} className="text-amber-500" />
-                    Chưa khớp danh sách lớp (Hãy chọn từ menu bên dưới để thống kê chính xác nhất)
+                    <Sparkles size={12} className="text-amber-500 shrink-0" />
+                    Hãy chọn tên từ danh sách lớp bên dưới để thống kê chính xác nhất
                   </span>
                 ) : null}
               </div>
@@ -685,12 +917,12 @@ export default function Quiz({
                       Danh sách lớp {studentInfo.class} ({studentInfo.school})
                     </span>
                     <span className="text-[10px] text-slate-400 font-normal">
-                      {getRosterSuggestions(studentInfo.name, classRoster).length} gợi ý
+                      {suggestions.length} gợi ý
                     </span>
                   </div>
 
                   <div className="overflow-y-auto divide-y divide-slate-100 flex-1 p-1">
-                    {getRosterSuggestions(studentInfo.name, classRoster).length === 0 ? (
+                    {suggestions.length === 0 ? (
                       <div className="p-4 text-center text-xs text-slate-400">
                         {classRoster.length === 0 ? (
                           <span>Chưa có danh sách lớp được tải lên. Bạn có thể tự nhập tên trực tiếp.</span>
@@ -699,10 +931,9 @@ export default function Quiz({
                         )}
                       </div>
                     ) : (
-                      getRosterSuggestions(studentInfo.name, classRoster).map((stName, idx) => {
+                      suggestions.map((stName, idx) => {
                         const isSelected = studentInfo.name.trim().toLowerCase() === stName.trim().toLowerCase();
                         const parts = stName.split(' ');
-                        const given = parts[parts.length - 1];
                         const initials = parts.map(p => p[0]).join('').slice(0, 2).toUpperCase();
 
                         return (
@@ -713,7 +944,7 @@ export default function Quiz({
                               setStudentInfo({ ...studentInfo, name: stName });
                               setShowNameDropdown(false);
                             }}
-                            className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between text-xs transition-colors group ${
+                            className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between text-xs transition-colors group cursor-pointer ${
                               isSelected 
                                 ? 'bg-blue-600 text-white font-black' 
                                 : 'hover:bg-blue-50 text-slate-800 font-medium'
@@ -796,16 +1027,16 @@ export default function Quiz({
 
           <button 
             onClick={() => {
-              if (!studentInfo.name || !studentInfo.class || !studentInfo.school) {
-                alert('Vui lòng nhập đầy đủ thông tin học sinh');
+              if (!cleanName(studentInfo.name) || !studentInfo.class || !studentInfo.school) {
+                showToast('Vui lòng nhập đầy đủ thông tin học sinh!');
                 return;
               }
               if (!selectedPart) {
-                alert('Vui lòng chọn phân môn / kiểu đề thi');
+                showToast('Vui lòng chọn phân môn / kiểu đề thi!');
                 return;
               }
               if (selectedPart !== 'all' && !selectedChapDropdown) {
-                alert('Vui lòng chọn chương học tương ứng');
+                showToast('Vui lòng chọn chương học tương ứng!');
                 return;
               }
               
@@ -815,9 +1046,9 @@ export default function Quiz({
                 startQuiz(selectedChapDropdown);
               }
             }}
-            className="w-full bg-blue-600 text-white py-3 md:py-4 rounded-lg md:rounded-xl font-black text-sm md:text-base hover:bg-blue-700 transition shadow-lg shadow-blue-100 mt-4 active:scale-95 transform tracking-widest uppercase flex items-center justify-center gap-2"
+            className="w-full bg-blue-600 text-white py-3 md:py-4 rounded-lg md:rounded-xl font-black text-sm md:text-base hover:bg-blue-700 transition shadow-lg shadow-blue-100 mt-4 active:scale-95 transform tracking-widest uppercase flex items-center justify-center gap-2 cursor-pointer"
           >
-            VÀO THI NGAY <ArrowRight size={18} />
+            VÀO THI NGAY <ChevronRight size={18} />
           </button>
         </div>
       </div>
@@ -830,32 +1061,80 @@ export default function Quiz({
 
   if (currentStep === 'doing' || currentStep === 'review') {
     const q = questions[currentIndex];
-    const progress = ((currentIndex + 1) / questions.length) * 100;
     const isReview = currentStep === 'review';
+    const currentChosenOption = getStudentChoice(currentIndex);
+    const currentCorrectOption = isReview ? resolveCorrectAnswerIndex(q) : -999;
+    const unansweredIndices = questions.map((_, idx) => idx).filter(idx => getStudentChoice(idx) === undefined);
+    const answeredCount = questions.length - unansweredIndices.length;
+    const progress = (answeredCount / questions.length) * 100;
 
     return (
-      <div className="max-w-5xl mx-auto px-1 md:px-0">
-        <div className="flex items-center justify-between bg-white p-2 md:p-4 rounded-xl md:rounded-2xl shadow-sm border border-slate-200 mb-3 md:mb-6 gap-2 md:gap-6">
-          <div className="flex gap-3 md:gap-6 items-center w-full md:w-auto justify-between md:justify-start px-1 md:px-0">
+      <div className="max-w-5xl mx-auto px-1 md:px-0 select-none">
+        {notice && (
+          <div className="mb-3 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <AlertCircle size={15} className="shrink-0 text-amber-600" />
+              <span>{notice.message}</span>
+            </div>
+            <button onClick={() => setNotice(null)} className="text-amber-500 hover:text-amber-700">
+              <X size={14} />
+            </button>
+          </div>
+        )}
+        {/* Top Status Bar */}
+        <div className="flex items-center justify-between bg-white p-2.5 md:p-4 rounded-xl md:rounded-2xl shadow-sm border border-slate-200 mb-3 md:mb-6 gap-2 md:gap-6">
+          <div className="flex gap-3 md:gap-5 items-center w-full md:w-auto justify-between md:justify-start px-1 md:px-0">
             <div className="text-center">
               <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Câu hỏi</div>
-              <div className="text-sm md:text-xl font-black text-slate-800 tracking-tight">{(currentIndex + 1).toString().padStart(2, '0')}<span className="text-slate-300 font-medium">/</span>{questions.length}</div>
+              <div className="text-sm md:text-xl font-black text-slate-800 tracking-tight">
+                {(currentIndex + 1).toString().padStart(2, '0')}
+                <span className="text-slate-300 font-medium">/</span>
+                {questions.length}
+              </div>
             </div>
             <div className="w-px bg-slate-100 h-6 md:h-10"></div>
             <div className="text-center">
-               <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Danh mục</div>
-               <div className="text-[9px] md:text-sm font-bold bg-blue-50 text-blue-600 px-1.5 md:px-3 py-0.5 md:py-1 rounded-md md:rounded-lg border border-blue-100">{q.category.split(' ')[0]}</div>
+              <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Danh mục</div>
+              <div className="text-[9px] md:text-xs font-bold bg-blue-50 text-blue-600 px-2 md:px-3 py-0.5 md:py-1 rounded-md md:rounded-lg border border-blue-100">
+                {q.category.split(' ')[0]}
+              </div>
             </div>
+            {!isReview && (
+              <>
+                <div className="w-px bg-slate-100 h-6 md:h-10"></div>
+                <div className="text-center">
+                  <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Thời gian</div>
+                  <div className="text-xs md:text-sm font-black text-slate-700 flex items-center gap-1">
+                    <Clock size={13} className="text-blue-500" />
+                    <span>{formatDuration(elapsedSeconds)}</span>
+                  </div>
+                </div>
+                <div className="w-px bg-slate-100 h-6 md:h-10"></div>
+                <div className="text-center" title="Hệ thống tự động phát hiện nếu bạn mở tab mới hoặc chuyển sang cửa sổ trình duyệt khác (Tối đa 3 lần)">
+                  <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Giám sát Tab</div>
+                  <div className={`text-[9px] md:text-xs font-black px-2 py-0.5 rounded-md border flex items-center gap-1 ${
+                    tabSwitchCount === 0
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-rose-50 text-rose-700 border-rose-200 animate-pulse'
+                  }`}>
+                    <ShieldAlert size={12} />
+                    <span>{tabSwitchCount}/{MAX_TAB_VIOLATIONS}</span>
+                  </div>
+                </div>
+              </>
+            )}
             <div className="flex md:hidden flex-col items-end">
-               <div className="text-[8px] text-slate-400 font-black uppercase tracking-widest">Tiến độ</div>
-               <div className="text-[10px] font-bold text-blue-600">{Math.round(progress)}%</div>
+              <div className="text-[8px] text-slate-400 font-black uppercase tracking-widest">Đã làm</div>
+              <div className="text-[10px] font-bold text-blue-600">{answeredCount}/{questions.length}</div>
             </div>
           </div>
 
-          <div className="flex-1 w-full md:px-12 hidden md:block">
+          <div className="flex-1 w-full md:px-8 hidden md:block">
             <div className="flex justify-between items-center mb-1">
-               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Tiến độ</span>
-               <span className="text-[9px] font-bold text-blue-600 uppercase tracking-widest">{Math.round(progress)}%</span>
+              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">
+                Đã hoàn thành: {answeredCount}/{questions.length} câu
+              </span>
+              <span className="text-[9px] font-bold text-blue-600 uppercase tracking-widest">{Math.round(progress)}%</span>
             </div>
             <div className="h-1.5 md:h-2 bg-slate-100 rounded-full overflow-hidden border border-slate-50">
               <motion.div 
@@ -866,12 +1145,12 @@ export default function Quiz({
             </div>
           </div>
           
-          <div className="hidden md:flex items-center gap-3 border-l pl-6 border-slate-100">
+          <div className="hidden md:flex items-center gap-3 border-l pl-6 border-slate-100 shrink-0">
             <div className="text-right">
               <div className="text-[8px] text-slate-400 font-black uppercase tracking-widest">Thí sinh</div>
-              <div className="text-xs font-bold text-slate-800">{studentInfo.name}</div>
+              <div className="text-xs font-bold text-slate-800 max-w-[140px] truncate">{studentInfo.name}</div>
             </div>
-            <div className="w-8 h-8 bg-slate-100 rounded-full flex items-center justify-center font-black text-slate-400 text-[10px] shadow-inner">
+            <div className="w-8 h-8 bg-slate-100 rounded-full flex items-center justify-center font-black text-slate-500 text-[10px] shadow-inner">
               {studentInfo.name.split(' ').pop()?.slice(0, 2).toUpperCase()}
             </div>
           </div>
@@ -886,7 +1165,17 @@ export default function Quiz({
               className="bg-white p-4 md:p-10 rounded-[1.5rem] md:rounded-[2.5rem] shadow-xl shadow-slate-200/50 border border-slate-100 min-h-0 md:min-h-[400px] flex flex-col relative overflow-hidden"
             >
               <div className="relative z-10 flex-1 flex flex-col">
-                <h3 className="text-[9px] md:text-xs font-black text-blue-600 uppercase tracking-[0.2em] mb-2 md:mb-6">Câu hỏi số {currentIndex + 1}:</h3>
+                <div className="flex items-center justify-between mb-2 md:mb-6">
+                  <h3 className="text-[9px] md:text-xs font-black text-blue-600 uppercase tracking-[0.2em]">
+                    Câu hỏi số {currentIndex + 1}:
+                  </h3>
+                  {q.chapter && (
+                    <span className="text-[9px] md:text-[10px] font-bold text-slate-400 truncate max-w-[220px] md:max-w-xs">
+                      {q.chapter.split('.')[0]}
+                    </span>
+                  )}
+                </div>
+
                 <div className="text-base md:text-2xl leading-relaxed font-bold text-slate-800 mb-4 md:mb-10 overflow-x-auto max-w-full">
                   <MathText text={q.content} />
                 </div>
@@ -896,39 +1185,39 @@ export default function Quiz({
                     <button
                       key={i}
                       disabled={isReview}
-                      onClick={() => !isReview && setUserAnswers({...userAnswers, [currentIndex]: i})}
-                      className={`group p-3 md:p-6 rounded-xl md:rounded-2xl border-2 text-left transition-all flex items-start gap-3 md:gap-5 relative overflow-hidden ${
+                      onClick={() => !isReview && selectStudentChoice(currentIndex, i)}
+                      className={`group p-3 md:p-6 rounded-xl md:rounded-2xl border-2 text-left transition-all flex items-start gap-3 md:gap-5 relative overflow-hidden cursor-pointer ${
                         isReview 
-                          ? i === q.correctAnswer 
+                          ? i === currentCorrectOption 
                             ? 'border-green-500 bg-green-50 text-green-900' 
-                            : userAnswers[currentIndex] === i 
+                            : currentChosenOption === i 
                               ? 'border-red-500 bg-red-50 text-red-900' 
                               : 'border-slate-50 bg-slate-50/50'
-                          : userAnswers[currentIndex] === i 
+                          : currentChosenOption === i 
                             ? 'border-blue-500 bg-blue-50 text-blue-900 shadow-md shadow-blue-100' 
-                            : 'border-slate-50 bg-slate-50/50 hover:border-slate-200 hover:bg-white hover:shadow-lg'
+                            : 'border-slate-100 bg-slate-50/50 hover:border-slate-200 hover:bg-white hover:shadow-lg'
                       }`}
                     >
                       <div className={`w-7 h-7 md:w-10 md:h-10 rounded-lg md:rounded-xl flex items-center justify-center font-black text-[10px] md:text-sm shrink-0 transition-all ${
                         isReview
-                          ? i === q.correctAnswer 
+                          ? i === currentCorrectOption 
                             ? 'bg-green-600 text-white shadow-lg shadow-green-200' 
-                            : userAnswers[currentIndex] === i 
+                            : currentChosenOption === i 
                               ? 'bg-red-600 text-white shadow-lg shadow-red-200' 
                               : 'bg-slate-200 text-slate-500'
-                          : userAnswers[currentIndex] === i ? 'bg-blue-600 text-white shadow-lg shadow-blue-200' : 'bg-slate-200 text-slate-500 group-hover:bg-slate-300'
+                          : currentChosenOption === i ? 'bg-blue-600 text-white shadow-lg shadow-blue-200' : 'bg-slate-200 text-slate-500 group-hover:bg-slate-300'
                       }`}>
                         {String.fromCharCode(65 + i)}
                       </div>
                       <div className="mt-0.5 md:mt-2 text-xs md:text-lg font-bold tracking-tight overflow-x-auto max-w-full flex-1 min-w-0">
                         <MathText text={opt} />
                       </div>
-                      {isReview && i === q.correctAnswer && (
+                      {isReview && i === currentCorrectOption && (
                         <div className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 text-green-500">
                           <CheckCircle2 size={16} className="md:w-6 md:h-6" />
                         </div>
                       )}
-                      {isReview && userAnswers[currentIndex] === i && i !== q.correctAnswer && (
+                      {isReview && currentChosenOption === i && i !== currentCorrectOption && (
                         <div className="absolute right-2 md:right-4 top-1/2 -translate-y-1/2 text-red-500">
                           <span className="text-lg md:text-2xl font-black">✕</span>
                         </div>
@@ -942,16 +1231,16 @@ export default function Quiz({
                 <button 
                   disabled={currentIndex === 0}
                   onClick={() => setCurrentIndex(prev => prev - 1)}
-                  className="px-3 md:px-8 py-2 md:py-3 rounded-lg md:rounded-xl text-[9px] md:text-sm text-slate-400 font-bold hover:bg-slate-50 disabled:opacity-20 transition-all uppercase tracking-widest"
+                  className="px-3 md:px-8 py-2 md:py-3 rounded-lg md:rounded-xl text-[9px] md:text-sm text-slate-500 font-bold hover:bg-slate-100 disabled:opacity-20 transition-all uppercase tracking-widest cursor-pointer"
                 >
                   ← TRƯỚC
                 </button>
                 
                 {currentIndex === questions.length - 1 && !isReview ? (
                   <button 
-                    onClick={handleSubmit}
+                    onClick={handleRequestSubmit}
                     disabled={isSubmitting}
-                    className="flex items-center gap-2 md:gap-3 px-5 md:px-10 py-2.5 md:py-4 bg-green-500 text-white rounded-xl md:rounded-2xl font-black text-[10px] md:text-base shadow-xl shadow-green-100 hover:bg-green-600 transition-all transform hover:-translate-y-0.5 active:translate-y-0"
+                    className="flex items-center gap-2 md:gap-3 px-5 md:px-10 py-2.5 md:py-4 bg-green-500 text-white rounded-xl md:rounded-2xl font-black text-[10px] md:text-base shadow-xl shadow-green-100 hover:bg-green-600 transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
                   >
                     {isSubmitting ? 'ĐANG NỘP...' : 'NỘP BÀI'} <Send size={14} className="md:w-5 md:h-5" />
                   </button>
@@ -964,7 +1253,7 @@ export default function Quiz({
                         setCurrentStep('result');
                       }
                     }}
-                    className="flex items-center gap-2 md:gap-3 px-5 md:px-10 py-2.5 md:py-4 bg-blue-600 text-white rounded-xl md:rounded-2xl font-black text-[10px] md:text-base shadow-xl shadow-blue-100 hover:bg-blue-700 transition-all transform hover:-translate-y-0.5 active:translate-y-0"
+                    className="flex items-center gap-2 md:gap-3 px-5 md:px-10 py-2.5 md:py-4 bg-blue-600 text-white rounded-xl md:rounded-2xl font-black text-[10px] md:text-base shadow-xl shadow-blue-100 hover:bg-blue-700 transition-all transform hover:-translate-y-0.5 active:translate-y-0 cursor-pointer"
                   >
                     {currentIndex === questions.length - 1 ? 'KẾT QUẢ' : 'TIẾP THEO'} <ChevronRight size={14} className="md:w-5 md:h-5" />
                   </button>
@@ -974,29 +1263,147 @@ export default function Quiz({
           </div>
 
           <div className="lg:col-span-3 flex flex-col gap-3 order-2 lg:order-2">
-             <div className="bg-white p-3 md:p-6 rounded-2xl md:rounded-3xl border border-slate-200 shadow-sm mb-4">
-                <h4 className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 md:mb-4">Danh sách câu</h4>
-                <div className="grid grid-cols-6 lg:grid-cols-4 gap-1.5 md:gap-2">
-                  {questions.map((_, i) => (
+            <div className="bg-white p-3 md:p-6 rounded-2xl md:rounded-3xl border border-slate-200 shadow-sm mb-4">
+              <div className="flex items-center justify-between mb-2 md:mb-4">
+                <h4 className="text-[8px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest">Danh sách câu</h4>
+                <span className="text-[10px] font-bold text-blue-600">{answeredCount}/{questions.length}</span>
+              </div>
+              <div className="grid grid-cols-8 lg:grid-cols-4 gap-1.5 md:gap-2">
+                {questions.map((itemQ, i) => {
+                  const chosenForI = getStudentChoice(i);
+                  return (
                     <button
                       key={i}
                       onClick={() => setCurrentIndex(i)}
-                      className={`w-full aspect-square rounded-lg md:rounded-xl font-black text-[10px] md:text-xs transition-all border flex items-center justify-center ${
+                      className={`w-full aspect-square rounded-lg md:rounded-xl font-black text-[10px] md:text-xs transition-all border flex items-center justify-center cursor-pointer ${
                         currentIndex === i ? 'bg-blue-600 text-white border-blue-600 shadow-md md:shadow-lg shadow-blue-200 scale-105' :
                         isReview
-                          ? userAnswers[i] === questions[i].correctAnswer 
-                            ? 'bg-green-50 text-green-600 border-green-100' 
-                            : 'bg-red-50 text-red-600 border-red-100'
-                          : userAnswers[i] !== undefined ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-slate-50 text-slate-300 border-slate-100'
+                          ? isStudentAnswerCorrect(itemQ, chosenForI)
+                            ? 'bg-green-50 text-green-600 border-green-200' 
+                            : 'bg-red-50 text-red-600 border-red-200'
+                          : chosenForI !== undefined ? 'bg-blue-50 text-blue-600 border-blue-200' : 'bg-slate-50 text-slate-400 border-slate-100'
                       }`}
                     >
                       {i + 1}
                     </button>
-                  ))}
-                </div>
-             </div>
+                  );
+                })}
+              </div>
+
+              {!isReview && (
+                <button
+                  onClick={handleRequestSubmit}
+                  disabled={isSubmitting}
+                  className={`w-full mt-4 py-2.5 rounded-xl font-black text-xs uppercase tracking-wider transition flex items-center justify-center gap-2 cursor-pointer ${
+                    answeredCount === questions.length
+                      ? 'bg-green-500 text-white shadow-lg shadow-green-100 hover:bg-green-600'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <Send size={13} />
+                  <span>{isSubmitting ? 'Đang nộp...' : 'Nộp bài ngay'}</span>
+                </button>
+              )}
+
+              {isReview && (
+                <button
+                  onClick={() => setCurrentStep('result')}
+                  className="w-full mt-4 py-2.5 bg-slate-900 text-white rounded-xl font-black text-xs uppercase tracking-wider hover:bg-slate-800 transition cursor-pointer"
+                >
+                  Quay lại Kết quả
+                </button>
+              )}
+            </div>
           </div>
         </div>
+
+        {/* Inline Unanswered Confirmation Modal */}
+        {showSubmitConfirm && (
+          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
+                  <AlertCircle size={22} />
+                </div>
+                <div>
+                  <h4 className="text-base font-black text-slate-900">Chưa hoàn thành tất cả câu hỏi</h4>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Bạn còn <strong className="text-rose-600">{unansweredIndices.length} câu chưa chọn đáp án</strong>:
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5 p-3 bg-slate-50 rounded-2xl border border-slate-100">
+                {unansweredIndices.map(idx => (
+                  <button
+                    key={idx}
+                    onClick={() => {
+                      setCurrentIndex(idx);
+                      setShowSubmitConfirm(false);
+                    }}
+                    className="px-2.5 py-1 bg-white border border-amber-300 text-amber-800 rounded-lg text-xs font-black hover:bg-amber-50 transition cursor-pointer"
+                  >
+                    Câu {idx + 1}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSubmitConfirm(false)}
+                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 transition cursor-pointer"
+                >
+                  Làm tiếp
+                </button>
+                <button
+                  type="button"
+                  onClick={() => executeSubmit()}
+                  disabled={isSubmitting}
+                  className="px-5 py-2 rounded-xl text-xs font-black bg-green-600 text-white hover:bg-green-700 shadow-lg shadow-green-200 transition cursor-pointer"
+                >
+                  Vẫn nộp bài ngay
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Anti-Tab-Switch / New Browser Window Violation Lock Modal */}
+        {showTabWarningModal && !isReview && (
+          <div className="fixed inset-0 z-[100] bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl shadow-2xl border-2 border-rose-500 max-w-md w-full p-6 md:p-8 text-center space-y-4">
+              <div className="w-16 h-16 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center mx-auto shadow-inner">
+                <ShieldAlert size={36} />
+              </div>
+              <div>
+                <span className="inline-block px-3 py-1 bg-rose-100 text-rose-700 text-[10px] font-black uppercase tracking-widest rounded-full mb-2">
+                  Cảnh báo vi phạm quy chế thi ({tabSwitchCount}/{MAX_TAB_VIOLATIONS})
+                </span>
+                <h4 className="text-lg md:text-xl font-black text-slate-900">
+                  Phát hiện mở Tab mới hoặc rời màn hình thi!
+                </h4>
+                <p className="text-xs md:text-sm text-slate-600 mt-2 leading-relaxed font-medium">
+                  Hệ thống giám sát phát hiện bạn vừa chuyển sang tab khác, mở cửa sổ trình duyệt mới hoặc thoát khỏi màn hình bài làm.
+                </p>
+              </div>
+
+              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-xs text-amber-900 font-bold text-left space-y-1">
+                <div>• Số lần vi phạm hiện tại: <strong className="text-rose-600">{tabSwitchCount} / {MAX_TAB_VIOLATIONS} lần</strong></div>
+                <div>• Nếu tái phạm đủ <strong className="text-rose-600">{MAX_TAB_VIOLATIONS} lần</strong>, hệ thống sẽ <strong>tự động thu bài và chấm điểm ngay lập tức</strong>!</div>
+                <div>• Toàn bộ số lần chuyển tab đều được lưu lại và gửi về cho giáo viên.</div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowTabWarningModal(false)}
+                className="w-full py-3.5 rounded-2xl text-xs md:text-sm font-black bg-rose-600 text-white hover:bg-rose-700 shadow-lg shadow-rose-200 transition uppercase tracking-wider cursor-pointer"
+              >
+                Tôi đã hiểu & Quay lại làm bài
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -1020,78 +1427,95 @@ export default function Quiz({
         <p className="text-[10px] md:text-base text-slate-400 mb-6 md:mb-8 font-bold px-4 tracking-tight">
           {isQuickPractice 
             ? 'Tuyệt vời! Bạn vừa hoàn thành bài luyện tập nhanh 16 câu hỏi.'
-            : <span>Chúc mừng <span className="text-blue-600 uppercase">{studentInfo.name}</span> đã hoàn thành.</span>}
+            : <span>Chúc mừng <span className="text-blue-600 uppercase">{studentInfo.name}</span> ({studentInfo.class}) đã hoàn thành.</span>}
         </p>
         
         <div className="mb-6 md:mb-10">
-           <div className="bg-blue-600 p-5 md:p-10 rounded-[1.5rem] md:rounded-[2.5rem] shadow-2xl shadow-blue-200 text-white inline-block min-w-[180px] md:min-w-[280px]">
-               <div className="text-[9px] md:text-[11px] text-blue-100 font-black uppercase tracking-[0.2em] mb-2 md:mb-4 leading-none">
-                 Điểm số của bạn
-               </div>
-               <div className="flex items-center justify-center gap-1 md:gap-2">
-                  <span className="text-4xl md:text-8xl font-black tracking-tighter">
-                    {score.toFixed(1)}
-                  </span>
-                  <span className="text-xl md:text-4xl font-bold text-blue-300">
-                    / 10
-                  </span>
-               </div>
-           </div>
+          <div className="bg-blue-600 p-5 md:p-10 rounded-[1.5rem] md:rounded-[2.5rem] shadow-2xl shadow-blue-200 text-white inline-block min-w-[180px] md:min-w-[280px]">
+            <div className="text-[9px] md:text-[11px] text-blue-100 font-black uppercase tracking-[0.2em] mb-2 md:mb-4 leading-none">
+              Điểm số của bạn
+            </div>
+            <div className="flex items-center justify-center gap-1 md:gap-2">
+              <span className="text-4xl md:text-8xl font-black tracking-tighter">
+                {score.toFixed(1)}
+              </span>
+              <span className="text-xl md:text-4xl font-bold text-blue-300">
+                / 10
+              </span>
+            </div>
+          </div>
         </div>
 
-        <div className="bg-slate-50 p-3 md:p-5 rounded-lg md:rounded-xl border border-slate-100 mb-6 md:mb-8 inline-flex items-center gap-2 md:gap-4 mx-4">
-           <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${score >= 5.0 ? 'bg-green-500' : 'bg-orange-500'}`}></div>
-           <span className="text-[9px] md:text-sm font-black text-slate-600 uppercase tracking-widest leading-none">
-             Đúng: <span className="text-slate-900">{correctCount}</span> / {questions.length} câu
-           </span>
+        {autoSubmittedByViolation && (
+          <div className="mb-5 p-3.5 bg-rose-50 border border-rose-200 rounded-2xl text-xs font-bold text-rose-700 max-w-md mx-auto flex items-center justify-center gap-2">
+            <ShieldAlert size={16} className="shrink-0 text-rose-600" />
+            <span>Bài thi đã được hệ thống tự động thu do bạn rời màn hình / mở tab mới quá {MAX_TAB_VIOLATIONS} lần!</span>
+          </div>
+        )}
+
+        <div className="bg-slate-50 p-3 md:p-5 rounded-lg md:rounded-xl border border-slate-100 mb-6 md:mb-8 inline-flex flex-wrap items-center justify-center gap-2 md:gap-4 mx-4">
+          <div className={`w-2 h-2 md:w-3 md:h-3 rounded-full ${score >= 5.0 ? 'bg-green-500' : 'bg-orange-500'}`}></div>
+          <span className="text-[9px] md:text-sm font-black text-slate-600 uppercase tracking-widest leading-none">
+            Đúng: <span className="text-slate-900">{correctCount}</span> / {questions.length} câu
+          </span>
+          <span className="text-slate-300">•</span>
+          <span className="text-[9px] md:text-sm font-bold text-slate-500">
+            ⏱️ {formatDuration(elapsedSeconds)}
+          </span>
+          {tabSwitchCount > 0 && (
+            <>
+              <span className="text-slate-300">•</span>
+              <span className="text-[9px] md:text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded-md border border-rose-200">
+                ⚠️ Rời tab: {tabSwitchCount} lần
+              </span>
+            </>
+          )}
         </div>
 
         <div className="grid grid-cols-2 lg:flex lg:flex-row gap-2 md:gap-3 justify-center px-2">
-            <button 
-              onClick={() => {
-                setCurrentIndex(0);
-                setCurrentStep('review');
-              }}
-              className="px-4 py-3 md:py-4 bg-blue-600 text-white rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-blue-700 transition shadow-lg shadow-blue-100 uppercase tracking-wider"
-            >
-              Xem lại bài
-            </button>
-            <button 
-              onClick={async () => {
-                if (isQuickPractice) {
-                  sessionStorage.removeItem('quiz_current_questions_session');
-                  setUserAnswers({});
-                  setCurrentIndex(0);
-                  setScore(0);
-                  setCorrectCount(0);
-                  setQuestions([]);
-                  setLoadingQuestions(true);
-                  const success = await fetchAndRandomize(quickPracticeChapter, true);
-                  if (success) {
-                    setStartTime(new Date());
-                    setCurrentStep('doing');
-                  }
-                } else {
-                  sessionStorage.removeItem('quiz_current_questions_session');
-                  setStudentInfo({ name: '', class: '', school: '' });
-                  setUserAnswers({});
-                  setCurrentIndex(0);
-                  setScore(0);
-                  setCorrectCount(0);
-                  setQuestions([]);
-                  setCurrentStep('info');
+          <button 
+            onClick={() => {
+              setCurrentIndex(0);
+              setCurrentStep('review');
+            }}
+            className="px-4 py-3 md:py-4 bg-blue-600 text-white rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-blue-700 transition shadow-lg shadow-blue-100 uppercase tracking-wider cursor-pointer"
+          >
+            Xem lại bài
+          </button>
+          <button 
+            onClick={async () => {
+              sessionStorage.removeItem('quiz_current_questions_session');
+              setEncryptedChoices({});
+              setCurrentIndex(0);
+              setScore(0);
+              setCorrectCount(0);
+              setElapsedSeconds(0);
+              setTabSwitchCount(0);
+              setShowTabWarningModal(false);
+              setAutoSubmittedByViolation(false);
+              setQuestions([]);
+              if (isQuickPractice) {
+                setLoadingQuestions(true);
+                const success = await fetchAndRandomize(quickPracticeChapter, true);
+                if (success) {
+                  setStartTime(new Date());
+                  setCurrentStep('doing');
                 }
-              }}
-              className="px-4 py-3 md:py-4 bg-slate-900 text-white rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-slate-800 transition shadow-lg shadow-slate-100 uppercase tracking-wider"
-            >
-              {isQuickPractice ? 'Luyện đề khác' : 'Làm đề mới'}
-            </button>
-            <button 
-              onClick={onBack}
-              className="px-4 py-3 md:py-4 bg-white text-slate-400 border border-slate-200 rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-slate-50 transition uppercase tracking-wider"
-            >
-              Trang chủ
-            </button>
+              } else {
+                // Keep studentInfo (school, class, name) intact so the student doesn't have to re-type!
+                setCurrentStep('info');
+              }
+            }}
+            className="px-4 py-3 md:py-4 bg-slate-900 text-white rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-slate-800 transition shadow-lg shadow-slate-100 uppercase tracking-wider cursor-pointer"
+          >
+            {isQuickPractice ? 'Luyện đề khác' : 'Làm đề mới'}
+          </button>
+          <button 
+            onClick={onBack}
+            className="col-span-2 lg:col-span-1 px-4 py-3 md:py-4 bg-white text-slate-500 border border-slate-200 rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-slate-50 transition uppercase tracking-wider cursor-pointer"
+          >
+            Trang chủ
+          </button>
         </div>
       </div>
     );

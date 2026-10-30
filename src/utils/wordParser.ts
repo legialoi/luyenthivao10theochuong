@@ -1,5 +1,6 @@
 import mammoth from 'mammoth';
 import { solveQuestion } from '../services/geminiService';
+import { preprocessDocxEquations } from './ommlToLatex';
 
 export interface ParsedQuestion {
   id?: string;
@@ -7,29 +8,44 @@ export interface ParsedQuestion {
   options: string[];
   correctAnswer: number;
   category: string;
+  chapter?: string;
 }
 
 export const parseWordToQuiz = async (file: File, category: string): Promise<ParsedQuestion[]> => {
-  const arrayBuffer = await file.arrayBuffer();
+  const rawBuffer = await file.arrayBuffer();
+  const arrayBuffer = await preprocessDocxEquations(rawBuffer);
   
   // mammoth.convertToHtml enables image extraction (converted to base64 by default)
   const result = await mammoth.convertToHtml({ arrayBuffer });
   const html = result.value;
 
+  // Convert <sup> and <sub> from Word formatting into LaTeX superscripts/subscripts before stripping HTML tags
+  const htmlWithMathSupSub = html
+    .replace(/([a-zA-Z0-9)\]])\s*<sup>([^<]+)<\/sup>/gi, (_, base, sup) => `$${base}^{${sup.trim()}}$`)
+    .replace(/([a-zA-Z0-9)\]])\s*<sub>([^<]+)<\/sub>/gi, (_, base, sub) => `$${base}_{${sub.trim()}}$`)
+    .replace(/<sup>([^<]+)<\/sup>/gi, (_, sup) => `$^{${sup.trim()}}$`)
+    .replace(/<sub>([^<]+)<\/sub>/gi, (_, sub) => `$_{${sub.trim()}}$`);
+
   // We convert some HTML to a pseudo-text that keeps <img> tags
-  // Replace <p> with newline to help our regex-based splitting
-  const pseudoText = html
-    .replace(/<p>/g, '')
-    .replace(/<\/p>/g, '\n')
+  // Replace <p>, <br>, <li>, <tr> with newline to help our regex-based splitting
+  const pseudoText = htmlWithMathSupSub
+    .replace(/<p[^>]*>/gi, '')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/tr>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
     .replace(/<(?!\/?img\b)[^>]*>/g, '') // Loại bỏ tất cả các thẻ HTML ngoại trừ <img>
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
 
-  // Split by "Câu [số]:" or "Câu [số]."
-  const questionBlocks = pseudoText.split(/Câu\s*\d+\s*[:.]/i).filter(block => block.trim().length > 0);
+  // Split by "Câu [số]:" or "Câu [số]." (at start of line or after newline)
+  const questionBlocks = pseudoText
+    .split(/(?:^|\n)\s*Câu\s*\d+\s*[:.]/i)
+    .filter(block => block.trim().length > 0);
   
   const parsedQuestions: ParsedQuestion[] = [];
 
@@ -38,66 +54,91 @@ export const parseWordToQuiz = async (file: File, category: string): Promise<Par
 
     // Bảo vệ thẻ <img>: Tạm thời thay thế các thẻ img bằng placeholder để tránh bị regex cắt nhầm bên trong chuỗi base64
     const images: string[] = [];
-    let textWithPlaceholders = trimmedBlock.replace(/<img\b[^>]*\/?>/gi, (match) => {
+    const textWithPlaceholders = trimmedBlock.replace(/<img\b[^>]*\/?>/gi, (match) => {
       images.push(match);
       return `###IMG_PLACEHOLDER_${images.length - 1}###`;
     });
 
     const restoreImages = (txt: string) => {
-      return txt.replace(/###IMG_PLACEHOLDER_(\d+)###/g, (_, index) => images[parseInt(index)]);
+      return txt.replace(/###IMG_PLACEHOLDER_(\d+)###/g, (_, index) => images[parseInt(index)] || '');
     };
-    
-    // Regex to find options A, B, C, D (Sử dụng văn bản đã được bảo vệ)
-    // Hỗ trợ dấu * nằm trước chữ cái (ví dụ: *A. Nội dung) hoặc sau chữ cái (ví dụ: A. *Nội dung)
-    const aMatch = textWithPlaceholders.match(/(\*?)A\s*[:.]([\s\S]*?)(?=\*?B\s*[:.]|$)/i);
-    const bMatch = textWithPlaceholders.match(/(\*?)B\s*[:.]([\s\S]*?)(?=\*?C\s*[:.]|$)/i);
-    const cMatch = textWithPlaceholders.match(/(\*?)C\s*[:.]([\s\S]*?)(?=\*?D\s*[:.]|$)/i);
-    const dMatch = textWithPlaceholders.match(/(\*?)D\s*[:.]([\s\S]*?)(?=Đáp án|Lời giải|$)/i);
 
-    // Question content is everything before the first option
-    const contentParts = textWithPlaceholders.split(/\*?[A-D]\s*[:.]/i);
-    const content = contentParts[0].trim();
+    // Tách phần "Đáp án: X" hoặc "Lời giải" ở cuối câu hỏi (nếu có)
+    let explicitAnswerIdx = -1;
+    const footerMatch = textWithPlaceholders.match(/(?:^|\n|\s)(?:Đáp án|Chọn đáp án|Đ\/a)\s*[:.]?\s*([A-D])\b/i);
+    if (footerMatch) {
+      explicitAnswerIdx = footerMatch[1].toUpperCase().charCodeAt(0) - 65;
+    }
 
-    // 1. Check for asterisk marker in options 
-    let correctIdx = -1;
+    // Cắt bỏ phần Đáp án / Lời giải phía cuối để không lẫn vào nội dung đáp án D
+    const cleanBody = textWithPlaceholders.replace(/(?:^|\n)\s*(?:Đáp án|Lời giải|Hướng dẫn giải)\s*[:.][\s\S]*$/i, '').trim();
+
+    // Tìm vị trí cuối cùng của các mốc đáp án IN HOA: A., B., C., D. theo đúng thứ tự A -> B -> C -> D
+    // Điều này tránh cắt nhầm "điểm A.", "đường thẳng d:", "tìm a, b." trong đề Toán
+    const findLastOptionPos = (letter: string, searchEnd: number): { index: number; markerLen: number; hasStar: boolean } | null => {
+      const sub = cleanBody.slice(0, searchEnd);
+      const regex = new RegExp(`(?:^|[\\n\\r\\t ]+)(\\*?)${letter}\\s*[:.]`, 'g');
+      let lastMatch: RegExpExecArray | null = null;
+      let m: RegExpExecArray | null;
+      while ((m = regex.exec(sub)) !== null) {
+        lastMatch = m;
+      }
+      if (!lastMatch) return null;
+      // Compute exact start of option marker (excluding leading whitespace/newline)
+      const fullMatch = lastMatch[0];
+      const leadingWsMatch = fullMatch.match(/^[\n\r\t ]+/);
+      const leadingWsLen = leadingWsMatch ? leadingWsMatch[0].length : 0;
+      const markerStart = lastMatch.index + leadingWsLen;
+      const markerLen = fullMatch.length - leadingWsLen;
+      return {
+        index: markerStart,
+        markerLen,
+        hasStar: lastMatch[1] === '*'
+      };
+    };
+
+    const dPos = findLastOptionPos('D', cleanBody.length);
+    const cPos = dPos ? findLastOptionPos('C', dPos.index) : null;
+    const bPos = cPos ? findLastOptionPos('B', cPos.index) : null;
+    const aPos = bPos ? findLastOptionPos('A', bPos.index) : null;
+
+    if (!aPos || !bPos || !cPos || !dPos) {
+      continue;
+    }
+
+    const content = cleanBody.slice(0, aPos.index).trim();
     const rawOptions = [
-      aMatch ? { prefix: aMatch[1], content: aMatch[2].trim() } : null,
-      bMatch ? { prefix: bMatch[1], content: bMatch[2].trim() } : null,
-      cMatch ? { prefix: cMatch[1], content: cMatch[2].trim() } : null,
-      dMatch ? { prefix: dMatch[1], content: dMatch[2].trim() } : null
+      { hasStar: aPos.hasStar, content: cleanBody.slice(aPos.index + aPos.markerLen, bPos.index).trim() },
+      { hasStar: bPos.hasStar, content: cleanBody.slice(bPos.index + bPos.markerLen, cPos.index).trim() },
+      { hasStar: cPos.hasStar, content: cleanBody.slice(cPos.index + cPos.markerLen, dPos.index).trim() },
+      { hasStar: dPos.hasStar, content: cleanBody.slice(dPos.index + dPos.markerLen).trim() }
     ];
 
+    let correctIdx = -1;
     const processedOptions = rawOptions.map((opt, i) => {
-      if (!opt) return '';
-      // Kiểm tra dấu * ở đầu chữ cái (*A.) hoặc đầu nội dung (A. *Nội dung)
-      if (opt.prefix === '*' || opt.content.startsWith('*')) {
+      if (opt.hasStar || opt.content.startsWith('*')) {
         correctIdx = i;
         return opt.content.startsWith('*') ? opt.content.substring(1).trim() : opt.content;
       }
       return opt.content;
     });
 
-    // 2. If no asterisk, check for "Đáp án: [A-D]"
-    if (correctIdx === -1) {
-      const ansMatch = textWithPlaceholders.match(/Đáp án\s*[:.]\s*([A-D])/i);
-      if (ansMatch) {
-        correctIdx = ansMatch[1].toUpperCase().charCodeAt(0) - 65;
-      }
+    if (correctIdx === -1 && explicitAnswerIdx !== -1) {
+      correctIdx = explicitAnswerIdx;
     }
 
-    // 3. Fallback to AI if still no answer
     if (correctIdx === -1 && content && processedOptions.every(o => o.length > 0)) {
       try {
         correctIdx = await solveQuestion(content, processedOptions);
       } catch (err) {
         console.error("AI Solve Error:", err);
-        correctIdx = 0; // Default fallback
+        correctIdx = 0;
       }
     } else if (correctIdx === -1) {
-      correctIdx = 0; // Final default
+      correctIdx = 0;
     }
 
-    if (content && aMatch && bMatch && cMatch && dMatch) {
+    if (content && processedOptions.every(o => o.length > 0)) {
       parsedQuestions.push({
         content: restoreImages(content),
         options: [
@@ -107,10 +148,11 @@ export const parseWordToQuiz = async (file: File, category: string): Promise<Par
           restoreImages(processedOptions[3])
         ],
         correctAnswer: correctIdx,
-        category: category
+        category
       });
     }
   }
 
   return parsedQuestions;
 };
+

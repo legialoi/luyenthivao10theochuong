@@ -84,16 +84,20 @@ export default function Quiz({
   const [notice, setNotice] = useState<{ type: 'error' | 'info'; message: string } | null>(null);
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
 
-  // Anti-tab-switch / New browser window proctoring state
+  // Anti-tab-switch / New browser window / Exit-Fullscreen proctoring state
   const [tabSwitchCount, setTabSwitchCount] = useState(0);
   const [showTabWarningModal, setShowTabWarningModal] = useState(false);
+  const [violationReason, setViolationReason] = useState<string>('Phát hiện mở Tab mới hoặc rời màn hình thi!');
   const [autoSubmittedByViolation, setAutoSubmittedByViolation] = useState(false);
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const wasInFullscreenRef = useRef<boolean>(false);
+  const isIntentionalFullscreenExitRef = useRef<boolean>(false);
   const lastViolationTimeRef = useRef<number>(0);
   const MAX_TAB_VIOLATIONS = 3;
 
   const requestExamFullscreen = useCallback(async () => {
     try {
+      isIntentionalFullscreenExitRef.current = false;
       const el = document.documentElement as any;
       if (!document.fullscreenElement && !(document as any).webkitFullscreenElement) {
         if (el.requestFullscreen) {
@@ -109,6 +113,8 @@ export default function Quiz({
 
   const exitExamFullscreen = useCallback(async () => {
     try {
+      isIntentionalFullscreenExitRef.current = true;
+      wasInFullscreenRef.current = false;
       const docAny = document as any;
       if (document.fullscreenElement || docAny.webkitFullscreenElement) {
         if (document.exitFullscreen) {
@@ -120,29 +126,6 @@ export default function Quiz({
     } catch (e) {
       // ignore
     }
-  }, []);
-
-  const toggleExamFullscreen = useCallback(() => {
-    const docAny = document as any;
-    if (document.fullscreenElement || docAny.webkitFullscreenElement) {
-      exitExamFullscreen();
-    } else {
-      requestExamFullscreen();
-    }
-  }, [requestExamFullscreen, exitExamFullscreen]);
-
-  useEffect(() => {
-    const handleFsChange = () => {
-      const docAny = document as any;
-      const isFs = Boolean(document.fullscreenElement || docAny.webkitFullscreenElement);
-      setIsNativeFullscreen(isFs);
-    };
-    document.addEventListener('fullscreenchange', handleFsChange);
-    document.addEventListener('webkitfullscreenchange', handleFsChange);
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFsChange);
-      document.removeEventListener('webkitfullscreenchange', handleFsChange);
-    };
   }, []);
 
   const showToast = useCallback((message: string, type: 'error' | 'info' = 'error') => {
@@ -708,16 +691,17 @@ export default function Quiz({
     };
   }, [currentStep, currentIndex, questions, showSubmitConfirm, showTabWarningModal, selectStudentChoice, showToast]);
 
-  // Anti-Tab-Switch & Anti-New-Browser-Window Proctoring Detector
+  // Anti-Tab-Switch, Anti-New-Browser-Window & Anti-Fullscreen-Exit Proctoring Detector
   useEffect(() => {
     if (currentStep !== 'doing' || isSubmitting) return;
 
-    const recordTabOrWindowViolation = () => {
+    const recordTabOrWindowViolation = (reasonText: string) => {
       const now = Date.now();
-      // Cooldown 1.5s so visibilitychange + blur firing together only counts as 1 switch
+      // Cooldown 1.5s so multiple events firing together for the same action only count as 1 violation
       if (now - lastViolationTimeRef.current < 1500) return;
       lastViolationTimeRef.current = now;
 
+      setViolationReason(reasonText);
       setTabSwitchCount(prev => {
         const nextCount = prev + 1;
         if (nextCount >= MAX_TAB_VIOLATIONS) {
@@ -732,23 +716,48 @@ export default function Quiz({
 
     const handleVisibilityChange = () => {
       if (document.hidden) {
-        recordTabOrWindowViolation();
+        recordTabOrWindowViolation('Phát hiện mở Tab mới hoặc ẩn màn hình bài thi!');
       }
     };
 
     const handleWindowBlur = () => {
       // Trigger when user switches to another browser window, opens a new tab/window, or uses Alt+Tab
       if (document.hasFocus && !document.hasFocus()) {
-        recordTabOrWindowViolation();
+        recordTabOrWindowViolation('Phát hiện chuyển sang cửa sổ trình duyệt mới hoặc ứng dụng khác!');
       }
     };
 
+    const handleFullscreenChange = () => {
+      const docAny = document as any;
+      const isFs = Boolean(document.fullscreenElement || docAny.webkitFullscreenElement);
+      setIsNativeFullscreen(isFs);
+
+      if (isFs) {
+        wasInFullscreenRef.current = true;
+      } else if (wasInFullscreenRef.current && !isIntentionalFullscreenExitRef.current) {
+        // Student exited Fullscreen mode (pressed Esc / F11 / browser exit button) during the exam!
+        recordTabOrWindowViolation('Phát hiện thoát chế độ Toàn màn hình (Fullscreen) khi đang làm bài!');
+      }
+    };
+
+    // Initialize current fullscreen state when entering 'doing'
+    const docAny = document as any;
+    const initialFs = Boolean(document.fullscreenElement || docAny.webkitFullscreenElement);
+    setIsNativeFullscreen(initialFs);
+    if (initialFs) {
+      wasInFullscreenRef.current = true;
+    }
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('blur', handleWindowBlur);
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('blur', handleWindowBlur);
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
     };
   }, [currentStep, isSubmitting, executeSubmit]);
 
@@ -1128,11 +1137,19 @@ export default function Quiz({
     const progress = (answeredCount / questions.length) * 100;
 
     return (
-      <div className={
-        !isReview
-          ? 'fixed inset-0 z-50 bg-[#f0f4f8] overflow-y-auto p-2 md:p-6 select-none'
-          : 'max-w-5xl mx-auto px-1 md:px-0 select-none'
-      }>
+      <div
+        onMouseDown={() => {
+          // Ensure fullscreen is locked on first interaction inside the exam room if not already active
+          if (!isReview && !isNativeFullscreen) {
+            requestExamFullscreen();
+          }
+        }}
+        className={
+          !isReview
+            ? 'fixed inset-0 z-50 bg-[#f0f4f8] overflow-y-auto p-2 md:p-6 select-none'
+            : 'max-w-5xl mx-auto px-1 md:px-0 select-none'
+        }
+      >
       <div className="max-w-5xl mx-auto">
         {notice && (
           <div className="mb-3 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold flex items-center justify-between gap-2">
@@ -1174,8 +1191,8 @@ export default function Quiz({
                   </div>
                 </div>
                 <div className="w-px bg-slate-100 h-6 md:h-10"></div>
-                <div className="text-center" title="Hệ thống tự động phát hiện nếu bạn mở tab mới hoặc chuyển sang cửa sổ trình duyệt khác (Tối đa 3 lần)">
-                  <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Giám sát Tab</div>
+                <div className="text-center" title="Hệ thống tự động phát hiện nếu bạn thoát Full màn hình, mở tab mới hoặc chuyển cửa sổ (Tối đa 3 lần)">
+                  <div className="text-[8px] md:text-[10px] text-slate-400 font-black uppercase tracking-widest leading-none mb-0.5 md:mb-1">Vi phạm</div>
                   <div className={`text-[9px] md:text-xs font-black px-2 py-0.5 rounded-md border flex items-center gap-1 ${
                     tabSwitchCount === 0
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
@@ -1188,16 +1205,22 @@ export default function Quiz({
                 <div className="w-px bg-slate-100 h-6 md:h-10"></div>
                 <button
                   type="button"
-                  onClick={toggleExamFullscreen}
-                  title={isNativeFullscreen ? 'Thu nhỏ màn hình' : 'Phóng to Toàn màn hình phòng thi'}
+                  onClick={() => {
+                    if (isNativeFullscreen) {
+                      showToast('Đang khóa chế độ Toàn màn hình! Nếu bạn thoát Full màn hình (nhấn Esc), hệ thống sẽ tính 1 lần cảnh báo vi phạm.', 'info');
+                    } else {
+                      requestExamFullscreen();
+                    }
+                  }}
+                  title={isNativeFullscreen ? 'Đang khóa Toàn màn hình (Thoát sẽ tính 1 lần vi phạm)' : 'Bấm để bật chế độ Toàn màn hình'}
                   className={`px-2.5 py-1.5 rounded-lg border text-[9px] md:text-xs font-black flex items-center gap-1.5 transition cursor-pointer ${
                     isNativeFullscreen
-                      ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
-                      : 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700 shadow-xs'
+                      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      : 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700 shadow-xs animate-pulse'
                   }`}
                 >
-                  {isNativeFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
-                  <span className="hidden sm:inline">{isNativeFullscreen ? 'Đang Full' : 'Full màn hình'}</span>
+                  <Maximize2 size={13} />
+                  <span className="hidden sm:inline">{isNativeFullscreen ? 'Đã khóa Full' : 'Bật Full màn hình'}</span>
                 </button>
               </>
             )}
@@ -1447,7 +1470,7 @@ export default function Quiz({
           </div>
         )}
 
-        {/* Anti-Tab-Switch / New Browser Window Violation Lock Modal */}
+        {/* Anti-Tab-Switch / New Browser Window / Exit Fullscreen Violation Lock Modal */}
         {showTabWarningModal && !isReview && (
           <div className="fixed inset-0 z-[100] bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-150">
             <div className="bg-white rounded-3xl shadow-2xl border-2 border-rose-500 max-w-md w-full p-6 md:p-8 text-center space-y-4">
@@ -1459,17 +1482,17 @@ export default function Quiz({
                   Cảnh báo vi phạm quy chế thi ({tabSwitchCount}/{MAX_TAB_VIOLATIONS})
                 </span>
                 <h4 className="text-lg md:text-xl font-black text-slate-900">
-                  Phát hiện mở Tab mới hoặc rời màn hình thi!
+                  {violationReason}
                 </h4>
                 <p className="text-xs md:text-sm text-slate-600 mt-2 leading-relaxed font-medium">
-                  Hệ thống giám sát phát hiện bạn vừa chuyển sang tab khác, mở cửa sổ trình duyệt mới hoặc thoát khỏi màn hình bài làm.
+                  Trong suốt thời gian làm bài, bạn bắt buộc phải giữ chế độ <strong>Toàn màn hình (Fullscreen)</strong> và không được mở tab/cửa sổ khác.
                 </p>
               </div>
 
               <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-xs text-amber-900 font-bold text-left space-y-1">
                 <div>• Số lần vi phạm hiện tại: <strong className="text-rose-600">{tabSwitchCount} / {MAX_TAB_VIOLATIONS} lần</strong></div>
-                <div>• Nếu tái phạm đủ <strong className="text-rose-600">{MAX_TAB_VIOLATIONS} lần</strong>, hệ thống sẽ <strong>tự động thu bài và chấm điểm ngay lập tức</strong>!</div>
-                <div>• Toàn bộ số lần chuyển tab đều được lưu lại và gửi về cho giáo viên.</div>
+                <div>• Mọi hành vi <strong>thoát Full màn hình (nhấn Esc)</strong> hoặc <strong>mở tab mới</strong> đều bị tính 1 lần cảnh báo.</div>
+                <div>• Nếu vi phạm đủ <strong className="text-rose-600">{MAX_TAB_VIOLATIONS} lần</strong>, hệ thống sẽ <strong>tự động thu bài và chấm điểm ngay lập tức</strong>!</div>
               </div>
 
               <button
@@ -1478,9 +1501,9 @@ export default function Quiz({
                   requestExamFullscreen();
                   setShowTabWarningModal(false);
                 }}
-                className="w-full py-3.5 rounded-2xl text-xs md:text-sm font-black bg-rose-600 text-white hover:bg-rose-700 shadow-lg shadow-rose-200 transition uppercase tracking-wider cursor-pointer"
+                className="w-full py-3.5 rounded-2xl text-xs md:text-sm font-black bg-rose-600 text-white hover:bg-rose-700 shadow-lg shadow-rose-200 transition uppercase tracking-wider cursor-pointer flex items-center justify-center gap-2"
               >
-                Tôi đã hiểu & Quay lại làm bài (Full màn hình)
+                <Maximize2 size={16} /> Bật lại Full màn hình & Tiếp tục làm bài
               </button>
             </div>
           </div>

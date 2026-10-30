@@ -9,47 +9,29 @@ import AdminPanel from './components/AdminPanel';
 import { Lock, GraduationCap, ArrowRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { auth, PART_CHAPTERS } from './lib/firebase';
-
-// Utility for password hashing
-async function hashSecret(text: string) {
-  const msgUint8 = new TextEncoder().encode(text);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
+import { verifyAdminCredentials, hasValidAdminSession, clearAdminSession } from './utils/security';
 
 export default function App() {
   const [view, setView] = useState<'landing' | 'quiz' | 'admin' | 'admin_login'>('landing');
   const [adminCreds, setAdminCreds] = useState({ user: '', pass: '' });
+  const [loginError, setLoginError] = useState<string | null>(null);
   const [isQuickPractice, setIsQuickPractice] = useState(false);
   const [quickPracticeChapter, setQuickPracticeChapter] = useState('all');
   useEffect(() => {
-    // Kiểm tra session cục bộ (local)
-    const isAdminSession = sessionStorage.getItem('isAdmin') === 'true';
-    if (isAdminSession) {
-      setView('admin'); // Tự động vào lại Admin nếu đã đăng nhập
+    if (hasValidAdminSession()) {
+      setView('admin');
     }
   }, []);
 
   const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const user = adminCreds.user.trim();
-    const pass = adminCreds.pass.trim();
-
-    // Hashes for: "101   101!@#" (1, 2, or 3 spaces)
-    const h1 = 'd2cdf3f325473e109ce29c85e017aeb7763ae9b0a5d55cda5891ffd515e68266'; // 3 spaces
-    const h2 = '6788db3d91c10705f4df8cf781ec7d1889813e339cd58ca68c4d51624b45502c'; // 2 spaces
-    const h3 = '6f98725838531776992520330dc372f87ee56b0d91244e837ea8a46b5fd66835'; // 1 space
-    
-    const inputHash = await hashSecret(pass);
-
-    if (user === 'legialoi' && (inputHash === h1 || inputHash === h2 || inputHash === h3)) {
-      // Vì lỗi auth/admin-restricted-operation từ Firebase, chúng ta chuyển sang 
-      // quản lý session cục bộ kết hợp với Relaxed Security Rules của Firestore.
+    setLoginError(null);
+    const isValid = await verifyAdminCredentials(adminCreds.user, adminCreds.pass);
+    if (isValid) {
+      setAdminCreds({ user: '', pass: '' });
       setView('admin');
-      sessionStorage.setItem('isAdmin', 'true');
     } else {
-      alert('Sai thông tin đăng nhập! Vui lòng kiểm tra lại Username/Password.');
+      setLoginError('Sai tên đăng nhập hoặc mật khẩu. Vui lòng kiểm tra lại!');
     }
   };
 
@@ -207,6 +189,11 @@ export default function App() {
                  <p className="text-slate-400 mt-2 font-medium">Xác thực quyền quản trị viên</p>
               </div>
               <form onSubmit={handleAdminLogin} className="space-y-6">
+                {loginError && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold rounded-xl text-center">
+                    {loginError}
+                  </div>
+                )}
                 <div>
                   <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">Tên đăng nhập</label>
                   <input 
@@ -214,7 +201,10 @@ export default function App() {
                     placeholder=""
                     className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-lg font-medium"
                     value={adminCreds.user}
-                    onChange={e => setAdminCreds({...adminCreds, user: e.target.value})}
+                    onChange={e => {
+                      setAdminCreds({...adminCreds, user: e.target.value});
+                      setLoginError(null);
+                    }}
                   />
                 </div>
                 <div>
@@ -224,17 +214,23 @@ export default function App() {
                     placeholder=""
                     className="w-full p-4 bg-slate-50 border border-slate-100 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-lg font-medium"
                     value={adminCreds.pass}
-                    onChange={e => setAdminCreds({...adminCreds, pass: e.target.value})}
+                    onChange={e => {
+                      setAdminCreds({...adminCreds, pass: e.target.value});
+                      setLoginError(null);
+                    }}
                   />
                 </div>
-                <button className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold text-lg hover:bg-blue-700 transition shadow-lg shadow-blue-200 mt-4 active:scale-95 transform">
+                <button className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold text-lg hover:bg-blue-700 transition shadow-lg shadow-blue-200 mt-4 active:scale-95 transform cursor-pointer">
                   ĐĂNG NHẬP
                 </button>
                 <div className="text-center">
                   <button 
                     type="button"
-                    onClick={() => setView('landing')} 
-                    className="text-slate-400 font-bold text-sm tracking-widest hover:text-slate-600 transition uppercase"
+                    onClick={() => {
+                      setLoginError(null);
+                      setView('landing');
+                    }} 
+                    className="text-slate-400 font-bold text-sm tracking-widest hover:text-slate-600 transition uppercase cursor-pointer"
                   >
                     HỦY BỎ
                   </button>
@@ -244,11 +240,11 @@ export default function App() {
           </motion.div>
         )}
 
-        {view === 'admin' && (
+        {view === 'admin' && hasValidAdminSession() && (
           <div className="min-h-screen bg-[#f0f4f8]">
             <AdminPanel onLogout={() => { 
+              clearAdminSession();
               setView('landing'); 
-              sessionStorage.removeItem('isAdmin');
               auth.signOut();
             }} />
           </div>

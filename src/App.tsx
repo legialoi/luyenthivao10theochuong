@@ -125,6 +125,13 @@ export default function App() {
 
                   <button 
                     onClick={() => {
+                      try {
+                        const el = document.documentElement as any;
+                        if (!document.fullscreenElement && !el.webkitFullscreenElement) {
+                          if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+                          else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+                        }
+                      } catch (e) {}
                       setIsQuickPractice(true);
                       setView('quiz');
                     }}
@@ -152,6 +159,9 @@ export default function App() {
               </div>
               <button 
                 onClick={() => {
+                  try {
+                    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                  } catch (e) {}
                   setView('landing');
                   setIsQuickPractice(false);
                 }} 
@@ -163,6 +173,9 @@ export default function App() {
             <div className="p-1 md:p-4 pb-10">
               <Quiz 
                 onBack={() => {
+                  try {
+                    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                  } catch (e) {}
                   setView('landing');
                   setIsQuickPractice(false);
                 }} 

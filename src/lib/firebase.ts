@@ -17,6 +17,8 @@ export interface Question {
   content: string;
   options: string[];
   correctAnswer: number;
+  answerSeal?: string;
+  _runtimeSeal?: string;
   category: string;
   chapter?: string;
   createdAt: Timestamp | Date;
@@ -52,6 +54,11 @@ export interface QuizResult {
   class: string;
   school?: string;
   score: number;
+  correctCount?: number;
+  totalQuestions?: number;
+  chapter?: string;
+  encryptedAnswers?: string;
+  tabSwitchCount?: number;
   startTime: Timestamp | Date;
   submittedAt: Timestamp | Date;
 }

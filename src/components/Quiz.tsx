@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { db, Question, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, query, where, documentId, limit } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
-import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
 import MathText from './MathText';
 import { getRosterSuggestions, matchResultToRoster, removeVietnameseTones, cleanName } from '../utils/nameMatcher';
 import {
@@ -88,8 +88,62 @@ export default function Quiz({
   const [tabSwitchCount, setTabSwitchCount] = useState(0);
   const [showTabWarningModal, setShowTabWarningModal] = useState(false);
   const [autoSubmittedByViolation, setAutoSubmittedByViolation] = useState(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
   const lastViolationTimeRef = useRef<number>(0);
   const MAX_TAB_VIOLATIONS = 3;
+
+  const requestExamFullscreen = useCallback(async () => {
+    try {
+      const el = document.documentElement as any;
+      if (!document.fullscreenElement && !(document as any).webkitFullscreenElement) {
+        if (el.requestFullscreen) {
+          await el.requestFullscreen();
+        } else if (el.webkitRequestFullscreen) {
+          await el.webkitRequestFullscreen();
+        }
+      }
+    } catch (e) {
+      // Ignore if blocked by iframe policy; full-viewport CSS mode still activates
+    }
+  }, []);
+
+  const exitExamFullscreen = useCallback(async () => {
+    try {
+      const docAny = document as any;
+      if (document.fullscreenElement || docAny.webkitFullscreenElement) {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if (docAny.webkitExitFullscreen) {
+          await docAny.webkitExitFullscreen();
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  const toggleExamFullscreen = useCallback(() => {
+    const docAny = document as any;
+    if (document.fullscreenElement || docAny.webkitFullscreenElement) {
+      exitExamFullscreen();
+    } else {
+      requestExamFullscreen();
+    }
+  }, [requestExamFullscreen, exitExamFullscreen]);
+
+  useEffect(() => {
+    const handleFsChange = () => {
+      const docAny = document as any;
+      const isFs = Boolean(document.fullscreenElement || docAny.webkitFullscreenElement);
+      setIsNativeFullscreen(isFs);
+    };
+    document.addEventListener('fullscreenchange', handleFsChange);
+    document.addEventListener('webkitfullscreenchange', handleFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFsChange);
+      document.removeEventListener('webkitfullscreenchange', handleFsChange);
+    };
+  }, []);
 
   const showToast = useCallback((message: string, type: 'error' | 'info' = 'error') => {
     setNotice({ type, message });
@@ -538,6 +592,7 @@ export default function Quiz({
     setScore(finalScore);
 
     if (isQuickPractice) {
+      await exitExamFullscreen();
       setCurrentStep('result');
     } else {
       // Ensure canonical name if matched in roster
@@ -563,13 +618,14 @@ export default function Quiz({
           startTime: Timestamp.fromDate(startTime || new Date()),
           submittedAt: serverTimestamp()
         });
+        await exitExamFullscreen();
         setCurrentStep('result');
       } catch (err) {
         handleFirestoreError(err, OperationType.WRITE, 'results');
       }
     }
     setIsSubmitting(false);
-  }, [questions, getStudentChoice, tabSwitchCount, isQuickPractice, studentInfo, classRoster, selectedChapter, startTime]);
+  }, [questions, getStudentChoice, tabSwitchCount, isQuickPractice, studentInfo, classRoster, selectedChapter, startTime, exitExamFullscreen]);
 
   const handleRequestSubmit = () => {
     const answeredCount = questions.filter((_, idx) => getStudentChoice(idx) !== undefined).length;
@@ -1040,6 +1096,9 @@ export default function Quiz({
                 return;
               }
               
+              // Enter Fullscreen immediately on user click gesture
+              requestExamFullscreen();
+
               if (selectedPart === 'all') {
                 startQuiz();
               } else {
@@ -1048,7 +1107,7 @@ export default function Quiz({
             }}
             className="w-full bg-blue-600 text-white py-3 md:py-4 rounded-lg md:rounded-xl font-black text-sm md:text-base hover:bg-blue-700 transition shadow-lg shadow-blue-100 mt-4 active:scale-95 transform tracking-widest uppercase flex items-center justify-center gap-2 cursor-pointer"
           >
-            VÀO THI NGAY <ChevronRight size={18} />
+            <Maximize2 size={16} /> VÀO THI NGAY (FULL MÀN HÌNH) <ChevronRight size={18} />
           </button>
         </div>
       </div>
@@ -1069,7 +1128,12 @@ export default function Quiz({
     const progress = (answeredCount / questions.length) * 100;
 
     return (
-      <div className="max-w-5xl mx-auto px-1 md:px-0 select-none">
+      <div className={
+        !isReview
+          ? 'fixed inset-0 z-50 bg-[#f0f4f8] overflow-y-auto p-2 md:p-6 select-none'
+          : 'max-w-5xl mx-auto px-1 md:px-0 select-none'
+      }>
+      <div className="max-w-5xl mx-auto">
         {notice && (
           <div className="mb-3 p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs font-bold flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
@@ -1121,6 +1185,20 @@ export default function Quiz({
                     <span>{tabSwitchCount}/{MAX_TAB_VIOLATIONS}</span>
                   </div>
                 </div>
+                <div className="w-px bg-slate-100 h-6 md:h-10"></div>
+                <button
+                  type="button"
+                  onClick={toggleExamFullscreen}
+                  title={isNativeFullscreen ? 'Thu nhỏ màn hình' : 'Phóng to Toàn màn hình phòng thi'}
+                  className={`px-2.5 py-1.5 rounded-lg border text-[9px] md:text-xs font-black flex items-center gap-1.5 transition cursor-pointer ${
+                    isNativeFullscreen
+                      ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
+                      : 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700 shadow-xs'
+                  }`}
+                >
+                  {isNativeFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                  <span className="hidden sm:inline">{isNativeFullscreen ? 'Đang Full' : 'Full màn hình'}</span>
+                </button>
               </>
             )}
             <div className="flex md:hidden flex-col items-end">
@@ -1396,14 +1474,18 @@ export default function Quiz({
 
               <button
                 type="button"
-                onClick={() => setShowTabWarningModal(false)}
+                onClick={() => {
+                  requestExamFullscreen();
+                  setShowTabWarningModal(false);
+                }}
                 className="w-full py-3.5 rounded-2xl text-xs md:text-sm font-black bg-rose-600 text-white hover:bg-rose-700 shadow-lg shadow-rose-200 transition uppercase tracking-wider cursor-pointer"
               >
-                Tôi đã hiểu & Quay lại làm bài
+                Tôi đã hiểu & Quay lại làm bài (Full màn hình)
               </button>
             </div>
           </div>
         )}
+      </div>
       </div>
     );
   }

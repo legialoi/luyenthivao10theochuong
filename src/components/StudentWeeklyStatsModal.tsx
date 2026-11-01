@@ -3,7 +3,7 @@ import { db, QuizResult, ClassRoster, handleFirestoreError, OperationType, SCHOO
 import { collection, doc, getDoc, setDoc, getDocs, query, where, Timestamp, deleteDoc } from 'firebase/firestore';
 import { X, AlertTriangle, CheckCircle2, UserX, Download, Upload, Users, Calendar, Filter, Search, Edit3, RefreshCw, FileSpreadsheet, ChevronRight, Info, Star, Award, Sparkles, BarChart2, Trash2, AlertCircle, ShieldAlert } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { matchResultToRoster } from '../utils/nameMatcher';
+import { matchResultToRoster, sortVietnameseRosterByGivenName, isLegacySortedByFamilyName, normalizeClassRosterOrder } from '../utils/nameMatcher';
 
 interface StudentWeeklyStatsModalProps {
   isOpen: boolean;
@@ -37,6 +37,7 @@ interface StudentWeekStatus {
 }
 
 interface StudentStatRow {
+  rosterIndex: number;
   name: string;
   school: string;
   className: string;
@@ -186,7 +187,21 @@ export default function StudentWeeklyStatsModal({
       let currentRoster: string[] = [];
       if (rosterSnap.exists()) {
         const data = rosterSnap.data() as ClassRoster;
-        currentRoster = data.students || [];
+        const savedStudents = data.students || [];
+        if (isLegacySortedByFamilyName(savedStudents)) {
+          // Tự động khôi phục các danh sách lớp cũ từng bị xếp theo chữ cái đầu của Họ về đúng thứ tự Tên A->Z chuẩn sổ điểm
+          currentRoster = sortVietnameseRosterByGivenName(savedStudents);
+          try {
+            await setDoc(doc(db, 'class_rosters', rosterDocId), {
+              ...data,
+              students: currentRoster,
+              updatedAt: Timestamp.now()
+            });
+            sessionStorage.setItem(`cached_${rosterDocId}`, JSON.stringify(currentRoster));
+          } catch (e) {}
+        } else {
+          currentRoster = savedStudents;
+        }
       }
 
       // 2. Fetch results for this school & class
@@ -201,11 +216,11 @@ export default function StudentWeeklyStatsModal({
 
       setResults(fetchedResults);
 
-      // If no roster saved yet, auto-populate with students found in results
+      // If no roster saved yet, auto-populate with students found in results ordered by Vietnamese Given Name (Tên A-Z)
       if (currentRoster.length === 0) {
         const distinctNames = Array.from<string>(new Set(fetchedResults.map(r => r.name.trim()).filter(Boolean)));
         if (distinctNames.length > 0) {
-          currentRoster = distinctNames.sort((a, b) => a.localeCompare(b, 'vi'));
+          currentRoster = sortVietnameseRosterByGivenName(distinctNames);
         }
       }
 
@@ -231,7 +246,8 @@ export default function StudentWeeklyStatsModal({
         })
         .filter(n => n.length > 0);
 
-      const uniqueNames = Array.from<string>(new Set(names)).sort((a, b) => a.localeCompare(b, 'vi'));
+      // Giữ nguyên chính xác thứ tự danh sách học sinh theo lớp (không tự ý đảo theo Họ)
+      const uniqueNames = Array.from<string>(new Set(names));
 
       const rosterDocId = `roster_${school.trim().replace(/\s+/g, '_')}_${className.trim().replace(/\s+/g, '_')}`;
       const payload: ClassRoster = {
@@ -430,7 +446,8 @@ export default function StudentWeeklyStatsModal({
           });
         }
 
-        const uniqueExtracted = Array.from<string>(new Set(extractedNames)).sort((a, b) => a.localeCompare(b, 'vi'));
+        // Giữ nguyên chính xác thứ tự STT học sinh từ tệp Excel của lớp
+        const uniqueExtracted = Array.from<string>(new Set(extractedNames));
 
         if (uniqueExtracted.length > 0) {
           setRosterInputText(uniqueExtracted.join('\n'));
@@ -465,8 +482,8 @@ export default function StudentWeeklyStatsModal({
   // Compile calculations for each student in the roster (plus any unmatched test-takers in this class)
   const studentStats: StudentStatRow[] = useMemo(() => {
     const baseRoster = roster.length > 0 
-      ? roster 
-      : Array.from<string>(new Set(results.map(r => r.name.trim()).filter(Boolean)));
+      ? normalizeClassRosterOrder(roster)
+      : sortVietnameseRosterByGivenName(Array.from<string>(new Set(results.map(r => r.name.trim()).filter(Boolean))));
 
     const resultsByStudentName = new Map<string, QuizResult[]>();
     const outsideRosterSet = new Set<string>();
@@ -498,9 +515,10 @@ export default function StudentWeeklyStatsModal({
       }
     });
 
-    const allStudentNames = [...baseRoster, ...Array.from(outsideRosterSet)];
+    const outsideSorted = sortVietnameseRosterByGivenName(Array.from(outsideRosterSet));
+    const allStudentNames = [...baseRoster, ...outsideSorted];
 
-    return allStudentNames.map(studentName => {
+    return allStudentNames.map((studentName, rosterIdx) => {
       const studentResults = resultsByStudentName.get(studentName) || [];
 
       const sortedResults = [...studentResults].sort((a, b) => {
@@ -598,6 +616,7 @@ export default function StudentWeeklyStatsModal({
       const highestOverallScore = allScores.length > 0 ? Math.max(...allScores) : null;
 
       return {
+        rosterIndex: rosterIdx + 1,
         name: studentName,
         school,
         className,
@@ -658,8 +677,8 @@ export default function StudentWeeklyStatsModal({
   const handleExportExcel = () => {
     const periodLabel = timeMode === 'month' ? `Thang_${selectedMonth}_${selectedYear}` : '4_Tuan_Gan_Nhat';
     
-    const excelData = filteredStudents.map((s, idx) => ({
-      'STT': idx + 1,
+    const excelData = filteredStudents.map((s) => ({
+      'STT': s.rosterIndex,
       'Họ và tên': s.name,
       'Lớp': s.className,
       'Trường': s.school,
@@ -893,17 +912,35 @@ export default function StudentWeeklyStatsModal({
               />
 
               <div className="flex items-center justify-between mt-1.5 flex-wrap gap-2">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <div className="text-[10px] text-slate-500 font-medium">
-                    Sĩ số: <span className="font-bold text-blue-600">{rosterInputText.split('\n').filter(s => s.trim()).length} học sinh</span> (Lớp {className})
+                    Sĩ số: <span className="font-bold text-blue-600">{rosterInputText.split('\n').filter(s => s.trim()).length} học sinh</span> (Giữ nguyên đúng thứ tự danh sách lớp)
                   </div>
                   {rosterInputText.trim() && (
-                    <button
-                      onClick={() => setRosterInputText('')}
-                      className="text-[10px] text-slate-400 hover:text-rose-600 font-bold underline cursor-pointer"
-                    >
-                      Xoá trắng
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const lines = rosterInputText
+                            .split('\n')
+                            .map(l => l.replace(/^\s*\d+[\.\-\s\)]+\s*/, '').trim())
+                            .filter(Boolean);
+                          const sorted = sortVietnameseRosterByGivenName(Array.from(new Set(lines)));
+                          setRosterInputText(sorted.join('\n'));
+                        }}
+                        className="text-[10px] text-blue-600 hover:text-blue-800 font-bold underline cursor-pointer"
+                        title="Sắp xếp danh sách theo Tên chính A→Z (chuẩn sổ điểm Việt Nam)"
+                      >
+                        Xếp Tên A→Z
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRosterInputText('')}
+                        className="text-[10px] text-slate-400 hover:text-rose-600 font-bold underline cursor-pointer"
+                      >
+                        Xoá trắng
+                      </button>
+                    </>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
@@ -1080,7 +1117,7 @@ export default function StudentWeeklyStatsModal({
                         title="Bấm để xem lịch sử các bài nộp của học sinh này"
                       >
                         <td className="py-2.5 pl-4 pr-2 text-center font-bold text-slate-400 text-[11px]">
-                          {(idx + 1).toString().padStart(2, '0')}
+                          {student.rosterIndex.toString().padStart(2, '0')}
                         </td>
                         <td className="py-2.5 px-3">
                           <div className="flex items-center gap-2 flex-wrap">

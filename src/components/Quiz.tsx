@@ -4,7 +4,7 @@ import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, q
 import { motion, AnimatePresence } from 'motion/react';
 import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
 import MathText from './MathText';
-import { getRosterSuggestions, matchResultToRoster, removeVietnameseTones, cleanName } from '../utils/nameMatcher';
+import { getRosterSuggestions, matchResultToRoster, removeVietnameseTones, cleanName, normalizeClassRosterOrder, sortVietnameseRosterByGivenName } from '../utils/nameMatcher';
 import {
   sanitizeQuestionForStudent,
   resolveCorrectAnswerIndex,
@@ -226,10 +226,10 @@ export default function Quiz({
         if (rosterSnap.exists()) {
           const data = rosterSnap.data() as ClassRoster;
           if (isMounted && data.students && data.students.length > 0) {
-            const sorted = [...data.students].sort((a, b) => a.localeCompare(b, 'vi'));
-            setClassRoster(sorted);
+            const ordered = normalizeClassRosterOrder(data.students);
+            setClassRoster(ordered);
             try {
-              sessionStorage.setItem(cacheKey, JSON.stringify(sorted));
+              sessionStorage.setItem(cacheKey, JSON.stringify(ordered));
             } catch (e) {}
             setIsRosterLoading(false);
             return;
@@ -246,9 +246,11 @@ export default function Quiz({
         const fetchedResults = resultsSnap.docs
           .map(d => d.data())
           .filter(r => !studentInfo.school || r.school === studentInfo.school || !r.school);
-        const distinctNames = Array.from<string>(
-          new Set(fetchedResults.map(r => (r.name || '').trim()).filter(Boolean))
-        ).sort((a, b) => a.localeCompare(b, 'vi'));
+        const distinctNames = sortVietnameseRosterByGivenName(
+          Array.from<string>(
+            new Set(fetchedResults.map(r => (r.name || '').trim()).filter(Boolean))
+          )
+        );
 
         if (isMounted) {
           setClassRoster(distinctNames);

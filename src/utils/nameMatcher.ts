@@ -193,3 +193,62 @@ export function getRosterSuggestions(
     return false;
   });
 }
+
+const viCollator = new Intl.Collator('vi', { sensitivity: 'variant', numeric: true });
+
+/**
+ * So sánh 2 họ tên học sinh theo chuẩn danh sách lớp Việt Nam:
+ * Ưu tiên xếp theo Tên chính (từ cuối) A -> Z, nếu trùng Tên thì xét Họ -> Tên đệm.
+ */
+export function compareVietnameseNames(nameA: string, nameB: string): number {
+  const a = parseNameParts(nameA);
+  const b = parseNameParts(nameB);
+
+  const cmpGiven = viCollator.compare(a.givenName, b.givenName);
+  if (cmpGiven !== 0) return cmpGiven;
+
+  const cmpFamily = viCollator.compare(a.familyName, b.familyName);
+  if (cmpFamily !== 0) return cmpFamily;
+
+  const cmpMiddle = viCollator.compare(a.familyAndMiddle, b.familyAndMiddle);
+  if (cmpMiddle !== 0) return cmpMiddle;
+
+  return viCollator.compare(a.fullName, b.fullName);
+}
+
+/**
+ * Sắp xếp danh sách học sinh theo chuẩn sổ điểm Việt Nam (theo Tên A -> Z, sau đó Họ & Tên đệm)
+ */
+export function sortVietnameseRosterByGivenName(names: string[]): string[] {
+  return [...names].sort(compareVietnameseNames);
+}
+
+/**
+ * Phát hiện danh sách lớp cũ bị sắp xếp nhầm theo chữ cái đầu của Họ (a.localeCompare(b, 'vi'))
+ * thay vì theo thứ tự danh sách lớp / theo Tên.
+ */
+export function isLegacySortedByFamilyName(roster: string[]): boolean {
+  if (!roster || roster.length < 4) return false;
+  const isSortedByFullString = roster.every(
+    (name, idx) => idx === 0 || viCollator.compare(roster[idx - 1], name) <= 0
+  );
+  const isSortedByGivenName = roster.every(
+    (name, idx) => idx === 0 || compareVietnameseNames(roster[idx - 1], name) <= 0
+  );
+  return isSortedByFullString && !isSortedByGivenName;
+}
+
+/**
+ * Chuẩn hóa thứ tự danh sách lớp:
+ * - Giữ nguyên thứ tự gốc của danh sách lớp (từ file Excel / giáo viên nhập).
+ * - Nếu phát hiện danh sách cũ từng bị lỗi xếp theo Họ (Bùi -> Đào -> Đặng -> Lê...),
+ *   tự động khôi phục về thứ tự chuẩn sổ điểm theo Tên (A -> Z).
+ */
+export function normalizeClassRosterOrder(roster: string[]): string[] {
+  if (!roster || roster.length === 0) return [];
+  if (isLegacySortedByFamilyName(roster)) {
+    return sortVietnameseRosterByGivenName(roster);
+  }
+  return [...roster];
+}
+

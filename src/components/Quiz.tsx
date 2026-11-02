@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { db, Question, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
+import { db, Question, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES, CHAPTER_NAMES, SPECIAL_EXAMS } from '../lib/firebase';
 import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, query, where, documentId, limit } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
 import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
@@ -21,6 +21,7 @@ const METADATA_TTL_MS = 10 * 60 * 1000; // 10 minutes
 function normalizeChapterStr(str?: string | null): string {
   if (!str) return '';
   return str
+    .normalize('NFC')
     .trim()
     .toUpperCase()
     .replace(/\s+/g, ' ')
@@ -29,6 +30,94 @@ function normalizeChapterStr(str?: string | null): string {
     .replace(/\\NOT=/g, '!=')
     .replace(/≠/g, '!=')
     .replace(/\^2/g, '²');
+}
+
+const CHAPTER_QUERY_ALIASES: Record<string, string[]> = {
+  [CHAPTER_NAMES.CH1]: [
+    CHAPTER_NAMES.CH1,
+    'Chương 1. PHƯƠNG TRÌNH VÀ HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN'
+  ],
+  [CHAPTER_NAMES.CH2]: [
+    CHAPTER_NAMES.CH2,
+    'Chương 2. PHƯƠNG TRÌNH VÀ BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN'
+  ],
+  [CHAPTER_NAMES.CH3]: [
+    CHAPTER_NAMES.CH3,
+    'Chương 3. CĂN BẬC HAI VÀ CĂN BẬC BA'
+  ],
+  [CHAPTER_NAMES.CH4]: [
+    CHAPTER_NAMES.CH4,
+    'Chương 4. HỆ THỨC LƯỢNG TRONG TAM GIÁC VUÔNG'
+  ],
+  [CHAPTER_NAMES.CH5]: [
+    CHAPTER_NAMES.CH5,
+    'Chương 5. ĐƯỜNG TRÒN'
+  ],
+  [CHAPTER_NAMES.CH6]: [
+    CHAPTER_NAMES.CH6,
+    'Chương VI. HÀM SỐ $y = ax^2 (a \\neq 0)$. PHƯƠNG TRÌNH BẬC HAI MỘT ẨN',
+    'Chương VI. HÀM SỐ $y = ax^2$ ($a \\neq 0$). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN',
+    'Chương 6. HÀM SỐ y = ax² (a ≠ 0). PHƯƠNG TRÌNH BẬC HAI MỘT ẨN'
+  ],
+  [CHAPTER_NAMES.CH7]: [
+    CHAPTER_NAMES.CH7,
+    'Chương 7. TẦN SỐ VÀ TẦN SỐ TƯƠNG ĐỐI'
+  ],
+  [CHAPTER_NAMES.CH8]: [
+    CHAPTER_NAMES.CH8,
+    'Chương 8. XÁC SUẤT CỦA BIẾN CỐ TRONG MỘT SỐ MÔ HÌNH XÁC SUẤT ĐƠN GIẢN'
+  ],
+  [CHAPTER_NAMES.CH9]: [
+    CHAPTER_NAMES.CH9,
+    'Chương 9. ĐƯỜNG TRÒN NGOẠI TIẾP VÀ ĐƯỜNG TRÒN NỘI TIẾP'
+  ],
+  [CHAPTER_NAMES.CH10]: [
+    CHAPTER_NAMES.CH10,
+    'Chương 10. MỘT SỐ HÌNH KHỐI TRONG THỰC TIỄN'
+  ]
+};
+
+function matchCanonicalChapter(chStr?: string | null): string | null {
+  const clean = normalizeChapterStr(chStr);
+  if (!clean) return null;
+
+  for (const canonical of Object.values(CHAPTER_NAMES)) {
+    if (clean === normalizeChapterStr(canonical)) {
+      return canonical;
+    }
+  }
+
+  // Fallback prefix matching by Roman or Arabic chapter number
+  const prefixRules: [RegExp, string][] = [
+    [/^CHƯƠNG\s+(X|10)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH10],
+    [/^CHƯƠNG\s+(IX|9)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH9],
+    [/^CHƯƠNG\s+(VIII|8)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH8],
+    [/^CHƯƠNG\s+(VII|7)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH7],
+    [/^CHƯƠNG\s+(VI|6)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH6],
+    [/^CHƯƠNG\s+(V|5)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH5],
+    [/^CHƯƠNG\s+(IV|4)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH4],
+    [/^CHƯƠNG\s+(III|3)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH3],
+    [/^CHƯƠNG\s+(II|2)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH2],
+    [/^CHƯƠNG\s+(I|1)(?:[\s.:_-]|$)/, CHAPTER_NAMES.CH1]
+  ];
+
+  for (const [regex, target] of prefixRules) {
+    if (regex.test(clean)) return target;
+  }
+
+  // Fallback keyword matching
+  if (clean.includes('HỆ HAI PHƯƠNG TRÌNH BẬC NHẤT HAI ẨN')) return CHAPTER_NAMES.CH1;
+  if (clean.includes('BẤT PHƯƠNG TRÌNH BẬC NHẤT MỘT ẨN')) return CHAPTER_NAMES.CH2;
+  if (clean.includes('CĂN BẬC HAI')) return CHAPTER_NAMES.CH3;
+  if (clean.includes('HỆ THỨC LƯỢNG TRONG TAM GIÁC VUÔNG')) return CHAPTER_NAMES.CH4;
+  if (clean.includes('ĐƯỜNG TRÒN NGOẠI TIẾP')) return CHAPTER_NAMES.CH9;
+  if (clean.includes('ĐƯỜNG TRÒN')) return CHAPTER_NAMES.CH5;
+  if (clean.includes('PHƯƠNG TRÌNH BẬC HAI MỘT ẨN')) return CHAPTER_NAMES.CH6;
+  if (clean.includes('TẦN SỐ')) return CHAPTER_NAMES.CH7;
+  if (clean.includes('XÁC SUẤT')) return CHAPTER_NAMES.CH8;
+  if (clean.includes('HÌNH KHỐI TRONG THỰC TIỄN')) return CHAPTER_NAMES.CH10;
+
+  return null;
 }
 
 export default function Quiz({ 
@@ -307,7 +396,7 @@ export default function Quiz({
         return result;
       };
 
-      // Load metadata with TTL validation
+      // Load metadata with TTL validation (ignore empty cache)
       const loadMetadataLists = async (forceRefresh = false): Promise<{ id: string; chapter: string; category: string }[]> => {
         let lists: any = null;
         if (!forceRefresh) {
@@ -315,7 +404,12 @@ export default function Quiz({
           if (cached) {
             try {
               const { data, timestamp } = JSON.parse(cached);
-              if (timestamp && Date.now() - timestamp < METADATA_TTL_MS) {
+              if (
+                timestamp &&
+                Date.now() - timestamp < METADATA_TTL_MS &&
+                Array.isArray(data?.allQuestions) &&
+                data.allQuestions.length > 0
+              ) {
                 lists = data;
               } else {
                 localStorage.removeItem(METADATA_CACHE_KEY);
@@ -331,7 +425,9 @@ export default function Quiz({
             const metaDoc = await getDoc(doc(db, 'metadata', 'questions'));
             if (metaDoc.exists()) {
               lists = metaDoc.data();
-              localStorage.setItem(METADATA_CACHE_KEY, JSON.stringify({ data: lists, timestamp: Date.now() }));
+              if (Array.isArray(lists?.allQuestions) && lists.allQuestions.length > 0) {
+                localStorage.setItem(METADATA_CACHE_KEY, JSON.stringify({ data: lists, timestamp: Date.now() }));
+              }
             }
           } catch (e) {
             handleFirestoreError(e, OperationType.GET, 'metadata/questions');
@@ -343,41 +439,232 @@ export default function Quiz({
 
       let allQsMetaData = await loadMetadataLists(false);
       let finalQuestions: Question[] = [];
+      const specialExamConfig = chap && SPECIAL_EXAMS[chap] ? SPECIAL_EXAMS[chap] : null;
 
-      if (isPractice || chap) {
-        const targetChap = isPractice ? (chap && chap !== 'all' ? chap : null) : chap;
+      // Helper trích câu hỏi trực tiếp từ một Chương cụ thể (dùng chung cho cả Chọn 1 Chương và Kiểm tra Giữa/Cuối kỳ)
+      const fetchPoolForChapter = async (
+        targetChap: string,
+        maxFetchCount = 16
+      ): Promise<Question[]> => {
+        const targetCanonical = matchCanonicalChapter(targetChap);
         const targetNorm = normalizeChapterStr(targetChap);
 
-        const pickFromMeta = (metaList: { id: string; chapter: string; category: string }[]) => {
-          const filtered = targetNorm
-            ? metaList.filter(q => normalizeChapterStr(q.chapter) === targetNorm)
-            : metaList;
-          return shuffle(filtered.map(q => q.id).filter(Boolean)).slice(0, 16);
+        const pickIdsFromMeta = (metaList: { id: string; chapter: string; category: string }[]) => {
+          const matched = metaList.filter(q => {
+            if (targetCanonical && matchCanonicalChapter(q.chapter) === targetCanonical) return true;
+            return normalizeChapterStr(q.chapter) === targetNorm;
+          });
+          return shuffle(matched.map(q => q.id).filter(Boolean)).slice(0, maxFetchCount);
         };
 
-        let selectedIds = pickFromMeta(allQsMetaData);
-        let fetchedQs = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
+        let ids = pickIdsFromMeta(allQsMetaData);
+        let chapterQs = ids.length > 0 ? await fetchByIds(ids) : [];
 
-        // If cached metadata had stale IDs, refresh metadata once
-        if (selectedIds.length > 0 && fetchedQs.length < Math.min(selectedIds.length, 16)) {
-          allQsMetaData = await loadMetadataLists(true);
-          selectedIds = pickFromMeta(allQsMetaData);
-          fetchedQs = selectedIds.length > 0 ? await fetchByIds(selectedIds) : [];
+        // Nếu không tìm thấy từ cache metadata hoặc bị thiếu, truy vấn trực tiếp Firestore của chương đó
+        if (chapterQs.length === 0) {
+          try {
+            const aliases = targetCanonical && CHAPTER_QUERY_ALIASES[targetCanonical]
+              ? CHAPTER_QUERY_ALIASES[targetCanonical]
+              : [targetChap];
+            const snap = await getDocs(
+              query(
+                collection(db, 'questions'),
+                where('chapter', 'in', aliases.slice(0, 10)),
+                limit(Math.max(maxFetchCount * 2, 24))
+              )
+            );
+            chapterQs = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
+          } catch (e) {
+            try {
+              const snap = await getDocs(
+                query(
+                  collection(db, 'questions'),
+                  where('chapter', '==', targetChap),
+                  limit(Math.max(maxFetchCount * 2, 24))
+                )
+              );
+              chapterQs = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
+            } catch (err2) {
+              handleFirestoreError(err2, OperationType.GET, 'questions');
+            }
+          }
         }
 
-        // Fallback: Direct Firestore query if metadata didn't return questions
-        if (fetchedQs.length === 0) {
+        return shuffle(chapterQs);
+      };
+
+      if (specialExamConfig) {
+        // Mode A1: Kiểm tra Giữa kỳ / Cuối kỳ (HK I & HK II)
+        // Trích trực tiếp từ từng chương thành phần giống hệt chế độ chọn từng chương
+        const requiredChaps = Array.from(
+          new Set([
+            ...Object.keys(specialExamConfig.fixedQuotas),
+            ...specialExamConfig.fillChapters,
+            ...specialExamConfig.fallbackChapters
+          ])
+        );
+
+        // Kiểm tra nếu metadata cache thiếu bất kỳ chương nào thì làm mới metadata trước
+        const hasAllInMeta = requiredChaps.every(chKey =>
+          allQsMetaData.some(q => matchCanonicalChapter(q.chapter) === chKey)
+        );
+        if (!hasAllInMeta) {
+          allQsMetaData = await loadMetadataLists(true);
+        }
+
+        // Tải song song ngân hàng câu hỏi của từng chương thuộc đề kiểm tra
+        const chapterPools: Record<string, Question[]> = {};
+        const poolResults = await Promise.all(
+          requiredChaps.map(async chKey => {
+            const qs = await fetchPoolForChapter(chKey, 16);
+            return [chKey, qs] as const;
+          })
+        );
+        poolResults.forEach(([chKey, qs]) => {
+          chapterPools[chKey] = shuffle(qs);
+        });
+
+        // Nếu tổng số câu lấy được từ các chương vẫn dưới 16 (do tên chương lưu khác chuẩn), quét bổ sung từ kho questions
+        const totalFoundInPools = Object.values(chapterPools).reduce((sum, arr) => sum + arr.length, 0);
+        if (totalFoundInPools < 16) {
           try {
-            let snapshot;
-            if (targetChap) {
-              snapshot = await getDocs(query(collection(db, 'questions'), where('chapter', '==', targetChap), limit(40)));
-            } else {
-              snapshot = await getDocs(query(collection(db, 'questions'), limit(40)));
-            }
-            const allFetched: Question[] = snapshot.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
-            fetchedQs = shuffle(allFetched).slice(0, 16);
+            const broadSnap = await getDocs(query(collection(db, 'questions'), limit(200)));
+            broadSnap.docs.forEach(d => {
+              const qObj = { id: d.id, ...(d.data() as any) } as Question;
+              const canonical = matchCanonicalChapter(qObj.chapter);
+              if (canonical && requiredChaps.includes(canonical)) {
+                if (!chapterPools[canonical]) chapterPools[canonical] = [];
+                if (!chapterPools[canonical].some(existing => existing.id === qObj.id)) {
+                  chapterPools[canonical].push(qObj);
+                }
+              }
+            });
+            requiredChaps.forEach(chKey => {
+              chapterPools[chKey] = shuffle(chapterPools[chKey] || []);
+            });
           } catch (e) {
             handleFirestoreError(e, OperationType.GET, 'questions');
+          }
+        }
+
+        const chosen: Question[] = [];
+        const usedIds = new Set<string>();
+
+        // Bước 1: Trích số câu cố định từ các chương đã thi (VD: Cuối kỳ I trích Chương I, II, III mỗi chương 2 câu; Cuối kỳ II trích Chương VI, VII, VIII mỗi chương 2 câu)
+        Object.entries(specialExamConfig.fixedQuotas).forEach(([chKey, quota]) => {
+          const pool = chapterPools[chKey] || [];
+          let taken = 0;
+          while (taken < quota && pool.length > 0 && chosen.length < 16) {
+            const item = pool.shift()!;
+            const idKey = item.id || item.content;
+            if (idKey && !usedIds.has(idKey)) {
+              chosen.push(item);
+              usedIds.add(idKey);
+              taken++;
+            }
+          }
+        });
+
+        // Bước 2: Trích đều từ các chương trọng tâm (fillChapters)
+        // - Giữa kỳ I (Chương I, II, III): 16 câu chia đều 3 chương -> 5 - 5 - 6 câu (~33.3% mỗi chương), tự động bù qua lại giữa 3 chương
+        // - Giữa kỳ II (Chương VI, VII, VIII): 16 câu chia đều 3 chương -> 5 - 5 - 6 câu (~33.3% mỗi chương), tự động bù qua lại giữa 3 chương
+        // - Cuối kỳ I (Chương IV, V): 10 câu còn lại chia đều 2 chương -> 5 - 5 câu, tự động bù qua lại
+        // - Cuối kỳ II (Chương IX, X): 10 câu còn lại chia đều 2 chương -> 5 - 5 câu, tự động bù qua lại
+        const shuffledFillChapters = shuffle(specialExamConfig.fillChapters);
+        const remainingSlots = Math.max(0, 16 - chosen.length);
+        const fillCount = shuffledFillChapters.length;
+
+        if (fillCount > 0 && remainingSlots > 0) {
+          const basePerChapter = Math.floor(remainingSlots / fillCount);
+          const remainder = remainingSlots % fillCount;
+
+          // Đợt 2a: Lấy đúng định mức chuẩn cho mỗi chương (5 - 5 - 6 hoặc 5 - 5)
+          shuffledFillChapters.forEach((chKey, idx) => {
+            const targetForThisChapter = basePerChapter + (idx < remainder ? 1 : 0);
+            const pool = chapterPools[chKey] || [];
+            let taken = 0;
+            while (taken < targetForThisChapter && pool.length > 0 && chosen.length < 16) {
+              const item = pool.shift()!;
+              const idKey = item.id || item.content;
+              if (idKey && !usedIds.has(idKey)) {
+                chosen.push(item);
+                usedIds.add(idKey);
+                taken++;
+              }
+            }
+          });
+
+          // Đợt 2b: Bù qua lại luân phiên (round-robin) giữa các chương trong nhóm nếu có chương ít câu hỏi hơn định mức
+          let addedInRound = true;
+          while (chosen.length < 16 && addedInRound) {
+            addedInRound = false;
+            for (const chKey of shuffledFillChapters) {
+              if (chosen.length >= 16) break;
+              const pool = chapterPools[chKey];
+              while (pool && pool.length > 0) {
+                const item = pool.shift()!;
+                const idKey = item.id || item.content;
+                if (idKey && !usedIds.has(idKey)) {
+                  chosen.push(item);
+                  usedIds.add(idKey);
+                  addedInRound = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Bước 3: Nếu vẫn chưa đủ 16 câu, bù luân phiên từ các chương cùng học kỳ (fallbackChapters)
+        if (chosen.length < 16 && specialExamConfig.fallbackChapters.length > 0) {
+          const shuffledFallbacks = shuffle(specialExamConfig.fallbackChapters);
+          let addedFallback = true;
+          while (chosen.length < 16 && addedFallback) {
+            addedFallback = false;
+            for (const chKey of shuffledFallbacks) {
+              if (chosen.length >= 16) break;
+              const pool = chapterPools[chKey];
+              while (pool && pool.length > 0) {
+                const item = pool.shift()!;
+                const idKey = item.id || item.content;
+                if (idKey && !usedIds.has(idKey)) {
+                  chosen.push(item);
+                  usedIds.add(idKey);
+                  addedFallback = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        if (chosen.length === 0) {
+          showToast('Các chương thuộc đề kiểm tra này hiện chưa có câu hỏi trong ngân hàng đề!');
+          setLoadingQuestions(false);
+          return false;
+        }
+
+        finalQuestions = shuffle(chosen).slice(0, 16);
+      } else if (isPractice || chap) {
+        const targetChap = isPractice ? (chap && chap !== 'all' ? chap : null) : chap;
+        let fetchedQs: Question[] = [];
+
+        if (targetChap) {
+          fetchedQs = await fetchPoolForChapter(targetChap, 16);
+          if (fetchedQs.length === 0) {
+            allQsMetaData = await loadMetadataLists(true);
+            fetchedQs = await fetchPoolForChapter(targetChap, 16);
+          }
+        } else {
+          const randomIds = shuffle(allQsMetaData.map(q => q.id).filter(Boolean)).slice(0, 16);
+          fetchedQs = randomIds.length > 0 ? await fetchByIds(randomIds) : [];
+          if (fetchedQs.length === 0) {
+            try {
+              const snapshot = await getDocs(query(collection(db, 'questions'), limit(40)));
+              fetchedQs = snapshot.docs.map(d => ({ id: d.id, ...(d.data() as any) } as Question));
+            } catch (e) {
+              handleFirestoreError(e, OperationType.GET, 'questions');
+            }
           }
         }
 
@@ -1062,6 +1349,10 @@ export default function Quiz({
                 <option value="Số và Đại số">Số và Đại số (Đại Số)</option>
                 <option value="Hình học và Đo lường">Hình học và Đo lường (Hình Học)</option>
                 <option value="Thống kê và Xác suất">Thống kê và Xác suất</option>
+                <option value="Kiểm tra giữa học kỳ I">Kiểm tra giữa học kỳ I</option>
+                <option value="Kiểm tra cuối học kỳ I">Kiểm tra cuối học kỳ I</option>
+                <option value="Kiểm tra giữa học kỳ II">Kiểm tra giữa học kỳ II</option>
+                <option value="Kiểm tra cuối học kỳ II">Kiểm tra cuối học kỳ II</option>
               </select>
               <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none opacity-40">
                 <ChevronRight size={14} className="rotate-90" />
@@ -1069,7 +1360,21 @@ export default function Quiz({
             </div>
           </div>
 
-          {selectedPart && selectedPart !== 'all' && (
+          {selectedPart && SPECIAL_EXAMS[selectedPart] && (
+            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-xl text-xs text-blue-900 font-semibold flex items-start gap-2 animate-in fade-in slide-in-from-top-1 duration-200">
+              <Sparkles size={15} className="text-blue-600 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-black text-blue-800 uppercase text-[11px] tracking-wide">
+                  Cấu trúc đề {SPECIAL_EXAMS[selectedPart].label} (16 câu)
+                </div>
+                <div className="text-[11px] text-blue-700 mt-0.5 leading-relaxed">
+                  {SPECIAL_EXAMS[selectedPart].description}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {selectedPart && selectedPart !== 'all' && !SPECIAL_EXAMS[selectedPart] && (
             <div className="animate-in fade-in slide-in-from-top-1 duration-200">
               <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Bước 2: Chọn chương học tương ứng</label>
               <div className="relative">
@@ -1102,7 +1407,7 @@ export default function Quiz({
                 showToast('Vui lòng chọn phân môn / kiểu đề thi!');
                 return;
               }
-              if (selectedPart !== 'all' && !selectedChapDropdown) {
+              if (selectedPart !== 'all' && !SPECIAL_EXAMS[selectedPart] && !selectedChapDropdown) {
                 showToast('Vui lòng chọn chương học tương ứng!');
                 return;
               }
@@ -1112,6 +1417,8 @@ export default function Quiz({
 
               if (selectedPart === 'all') {
                 startQuiz();
+              } else if (SPECIAL_EXAMS[selectedPart]) {
+                startQuiz(selectedPart);
               } else {
                 startQuiz(selectedChapDropdown);
               }

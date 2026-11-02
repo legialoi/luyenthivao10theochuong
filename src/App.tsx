@@ -8,7 +8,7 @@ import Quiz from './components/Quiz';
 import AdminPanel from './components/AdminPanel';
 import { Lock, GraduationCap, ArrowRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { auth, PART_CHAPTERS } from './lib/firebase';
+import { auth, PART_CHAPTERS, SPECIAL_EXAMS } from './lib/firebase';
 import { verifyAdminCredentials, hasValidAdminSession, clearAdminSession } from './utils/security';
 
 export default function App() {
@@ -111,6 +111,11 @@ export default function App() {
                         className="w-full text-left p-2.5 rounded-xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-amber-500 focus:bg-white text-xs font-bold text-slate-700 cursor-pointer appearance-none shadow-sm pr-8 pl-4"
                       >
                         <option value="all">⚡ Ngẫu nhiên tất cả chương</option>
+                        {Object.keys(SPECIAL_EXAMS).map((examKey) => (
+                          <option key={examKey} value={examKey}>
+                            🎯 {examKey}
+                          </option>
+                        ))}
                         {Object.values(PART_CHAPTERS).flat().map((chap, idx) => (
                           <option key={idx} value={chap}>
                             📖 {chap}

@@ -409,3 +409,107 @@ export function clearAdminSession(): void {
     // ignore
   }
 }
+
+// ============================================================================
+// CLASS SECURITY PASSCODE (MÃ BẢO MẬT LỚP 9A8, 9A9, HỌC THÊM)
+// ============================================================================
+
+const _MASKED_DEFAULT_CLASS_CODES: Record<string, number[]> = {
+  '9A8': [0x63, 0x30, 0xb0, 0xad, 0x86, 0xff, 0xd2],
+  '9A9': [0x63, 0x30, 0xb1, 0xad, 0x86, 0xff, 0xd2],
+  'Học thêm': [0x12, 0x25, 0xba, 0xaf, 0x84, 0xfb]
+};
+
+function decodeDefaultClassCode(className: string): string {
+  const bytes = _MASKED_DEFAULT_CLASS_CODES[className] || _MASKED_DEFAULT_CLASS_CODES['9A8'];
+  return bytes.map((b, i) => String.fromCharCode(b ^ ((i * 23 + 0x5a) & 0xff))).join('');
+}
+
+function normalizeClassPasscode(code: string): string {
+  return (code || '').trim().toUpperCase();
+}
+
+/**
+ * Seals a class passcode into an encrypted token (`cp2.<salt>.<cipherHex>`) for Firestore storage
+ * so students inspecting F12 Network / Console cannot read plaintext class passcodes.
+ */
+export function sealClassPasscode(className: string, plainCode: string): string {
+  const cleanClass = (className || '').trim();
+  const cleanCode = (plainCode || '').trim();
+  const normCode = normalizeClassPasscode(cleanCode);
+  const salt = Math.floor(0x100000 + Math.random() * 0xefffff).toString(16);
+  const sig = computeSignature(`CLS_PASS_V2::${cleanClass}::${normCode}`, salt).slice(0, 16);
+  const payload = JSON.stringify({
+    c: cleanCode,
+    s: salt,
+    h: sig
+  });
+  return `cp2.${salt}.${xorCipherHex(payload, `CLS_KEY_${salt}_${cleanClass}`)}`;
+}
+
+/**
+ * Unseals a class passcode token for display in AdminPanel.
+ */
+export function unsealClassPasscodeForAdmin(className: string, seal?: string | null): string {
+  const cleanClass = (className || '').trim();
+  if (seal && typeof seal === 'string' && seal.startsWith('cp2.')) {
+    try {
+      const parts = seal.split('.');
+      if (parts.length === 3) {
+        const salt = parts[1];
+        const raw = xorDecipherHex(parts[2], `CLS_KEY_${salt}_${cleanClass}`);
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.c === 'string' && parsed.s === salt) {
+          return parsed.c;
+        }
+      }
+    } catch (e) {
+      // Fallback to default
+    }
+  }
+  return decodeDefaultClassCode(cleanClass);
+}
+
+/**
+ * Verifies a student-entered passcode against the class's sealed passcode token.
+ */
+export function verifyClassPasscode(
+  className: string,
+  inputCode: string,
+  sealMap?: Record<string, string> | null
+): boolean {
+  const cleanClass = (className || '').trim();
+  const normInput = normalizeClassPasscode(inputCode);
+  if (!normInput) return false;
+
+  const seal = sealMap && typeof sealMap[cleanClass] === 'string' ? sealMap[cleanClass] : null;
+  if (seal && seal.startsWith('cp2.')) {
+    try {
+      const parts = seal.split('.');
+      if (parts.length === 3) {
+        const salt = parts[1];
+        const raw = xorDecipherHex(parts[2], `CLS_KEY_${salt}_${cleanClass}`);
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.s === salt) {
+          const candidateSig = computeSignature(`CLS_PASS_V2::${cleanClass}::${normInput}`, salt).slice(0, 16);
+          if (candidateSig === parsed.h) return true;
+          return normalizeClassPasscode(parsed.c) === normInput;
+        }
+      }
+    } catch (e) {
+      // Fall through to default check if corrupt
+    }
+  }
+
+  const fallbackDefault = normalizeClassPasscode(decodeDefaultClassCode(cleanClass));
+  return normInput === fallbackDefault;
+}
+
+export function getDefaultClassPasscodeSeals(): Record<string, string> {
+  return {
+    '9A8': sealClassPasscode('9A8', decodeDefaultClassCode('9A8')),
+    '9A9': sealClassPasscode('9A9', decodeDefaultClassCode('9A9')),
+    'Học thêm': sealClassPasscode('Học thêm', decodeDefaultClassCode('Học thêm'))
+  };
+}
+

@@ -6,10 +6,11 @@
 import React, { useState, useEffect } from 'react';
 import Quiz from './components/Quiz';
 import AdminPanel from './components/AdminPanel';
-import { Lock, GraduationCap, ArrowRight } from 'lucide-react';
+import { Lock, GraduationCap, ArrowRight, KeyRound, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { auth, PART_CHAPTERS, SPECIAL_EXAMS } from './lib/firebase';
-import { verifyAdminCredentials, hasValidAdminSession, clearAdminSession } from './utils/security';
+import { auth, db, PART_CHAPTERS, SPECIAL_EXAMS } from './lib/firebase';
+import { doc, getDoc } from 'firebase/firestore';
+import { verifyAdminCredentials, hasValidAdminSession, clearAdminSession, verifyClassPasscode } from './utils/security';
 
 export default function App() {
   const [view, setView] = useState<'landing' | 'quiz' | 'admin' | 'admin_login'>('landing');
@@ -17,11 +18,31 @@ export default function App() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isQuickPractice, setIsQuickPractice] = useState(false);
   const [quickPracticeChapter, setQuickPracticeChapter] = useState('all');
+  const [quickPracticeClass, setQuickPracticeClass] = useState('9A8');
+  const [quickPracticePasscode, setQuickPracticePasscode] = useState('');
+  const [quickPracticeError, setQuickPracticeError] = useState<string | null>(null);
+  const [classPasscodeSeals, setClassPasscodeSeals] = useState<Record<string, string> | null>(null);
+
   useEffect(() => {
     if (hasValidAdminSession()) {
       setView('admin');
     }
   }, []);
+
+  useEffect(() => {
+    if (view !== 'landing') return;
+    let mounted = true;
+    getDoc(doc(db, 'metadata', 'class_passcodes'))
+      .then(snap => {
+        if (mounted && snap.exists()) {
+          setClassPasscodeSeals(snap.data()?.seals || null);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, [view]);
 
   const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,7 +101,7 @@ export default function App() {
                   </div>
                   <h3 className="text-lg font-black mb-1 text-slate-800">Luyện Thi Chính Thức</h3>
                   <p className="text-slate-500 mb-4 leading-relaxed text-[11px] font-medium max-w-xs">
-                    Phần thi đầy đủ 16 câu (10 điểm), yêu cầu nhập tên lớp và lưu lịch sử bài làm.
+                    Phần thi đầy đủ 16 câu (10 điểm), yêu cầu nhập tên lớp, mã bảo mật lớp và lưu lịch sử bài làm.
                   </p>
                   <div className="inline-flex items-center gap-2 px-5 py-1.5 bg-blue-600 text-white rounded-lg font-bold text-sm shadow-lg shadow-blue-200 group-hover:bg-blue-700 transition-colors mt-auto">
                     VÀO THI NGAY <ArrowRight size={16} />
@@ -95,14 +116,51 @@ export default function App() {
                     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-zap"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46L12.14 10l5.84.57a1 1 0 0 1 .77 1.62l-9.9 10.2a.5.5 0 0 1-.86-.46L9.86 14Z"/></svg>
                   </div>
                   <h3 className="text-lg font-black mb-1 text-slate-800">Luyện Tập Nhanh</h3>
-                  <p className="text-slate-500 mb-4 leading-relaxed text-[11px] font-medium max-w-xs">
-                    Thử sức nhẹ nhàng với 16 câu hỏi ngẫu nhiên lập tức mà không cần khai báo danh tính.
+                  <p className="text-slate-500 mb-3 leading-relaxed text-[11px] font-medium max-w-xs">
+                    Thử sức với 16 câu hỏi ngẫu nhiên (chọn lớp & nhập mã bảo mật lớp để vào luyện).
                   </p>
 
+                  {/* Chọn Lớp & Nhập Mã bảo mật lớp */}
+                  <div className="w-full max-w-xs mx-auto grid grid-cols-5 gap-2 mb-2.5 text-left">
+                    <div className="col-span-2">
+                      <label className="block text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1">
+                        Lớp
+                      </label>
+                      <select
+                        value={quickPracticeClass}
+                        onChange={(e) => {
+                          setQuickPracticeClass(e.target.value);
+                          setQuickPracticeError(null);
+                        }}
+                        className="w-full p-2 rounded-xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-amber-500 focus:bg-white text-xs font-bold text-slate-700 cursor-pointer"
+                      >
+                        <option value="9A8">Lớp 9A8</option>
+                        <option value="9A9">Lớp 9A9</option>
+                        <option value="Học thêm">Học thêm</option>
+                      </select>
+                    </div>
+                    <div className="col-span-3">
+                      <label className="block text-[9px] font-black text-slate-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+                        <KeyRound size={10} className="text-amber-600" />
+                        <span>Mã bảo mật {quickPracticeClass}</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={quickPracticePasscode}
+                        onChange={(e) => {
+                          setQuickPracticePasscode(e.target.value);
+                          setQuickPracticeError(null);
+                        }}
+                        placeholder={`Nhập mã lớp ${quickPracticeClass}...`}
+                        className="w-full p-2 rounded-xl border border-slate-200 bg-slate-50 outline-none focus:ring-2 focus:ring-amber-500 focus:bg-white text-xs font-bold text-slate-800"
+                      />
+                    </div>
+                  </div>
+
                   {/* Menu thả xuống chọn chương học */}
-                  <div className="w-full mt-1 mb-4 select-none">
-                    <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1.5 text-center">
-                      Chọn chương học luyện tập (16 câu)
+                  <div className="w-full mb-3 select-none">
+                    <label className="block text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 text-left max-w-xs mx-auto">
+                      Chọn chương / kiểu đề luyện tập (16 câu)
                     </label>
                     <div className="relative max-w-xs mx-auto">
                       <select
@@ -128,8 +186,38 @@ export default function App() {
                     </div>
                   </div>
 
+                  {quickPracticeError && (
+                    <div className="w-full max-w-xs mx-auto mb-3 p-2 bg-rose-50 border border-rose-200 rounded-xl text-[11px] font-bold text-rose-700 flex items-center gap-1.5 text-left">
+                      <AlertCircle size={13} className="shrink-0 text-rose-600" />
+                      <span>{quickPracticeError}</span>
+                    </div>
+                  )}
+
                   <button 
-                    onClick={() => {
+                    onClick={async () => {
+                      if (!quickPracticePasscode.trim()) {
+                        setQuickPracticeError(`Vui lòng nhập Mã bảo mật của lớp ${quickPracticeClass} để vào luyện tập!`);
+                        return;
+                      }
+
+                      let currentSeals = classPasscodeSeals;
+                      if (!currentSeals) {
+                        try {
+                          const snap = await getDoc(doc(db, 'metadata', 'class_passcodes'));
+                          if (snap.exists()) {
+                            currentSeals = snap.data()?.seals || null;
+                            setClassPasscodeSeals(currentSeals);
+                          }
+                        } catch (e) {}
+                      }
+
+                      if (!verifyClassPasscode(quickPracticeClass, quickPracticePasscode, currentSeals)) {
+                        setQuickPracticeError(`Mã bảo mật lớp ${quickPracticeClass} không đúng! Vui lòng kiểm tra lại.`);
+                        return;
+                      }
+
+                      setQuickPracticeError(null);
+                      setQuickPracticePasscode('');
                       try {
                         const el = document.documentElement as any;
                         if (!document.fullscreenElement && !el.webkitFullscreenElement) {
@@ -186,6 +274,7 @@ export default function App() {
                 }} 
                 isQuickPractice={isQuickPractice}
                 quickPracticeChapter={quickPracticeChapter}
+                quickPracticeClass={quickPracticeClass}
               />
             </div>
           </motion.div>

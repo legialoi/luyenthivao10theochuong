@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { db, Question, ClassRoster, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES, CHAPTER_NAMES, SPECIAL_EXAMS } from '../lib/firebase';
 import { collection, addDoc, getDocs, Timestamp, serverTimestamp, doc, getDoc, query, where, documentId, limit } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
-import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
+import { CheckCircle2, ChevronRight, ChevronLeft, Send, User, School, GraduationCap, Users, ChevronDown, Check, Sparkles, Clock, AlertCircle, X, ShieldAlert, Maximize2, KeyRound } from 'lucide-react';
 import MathText from './MathText';
 import { getRosterSuggestions, matchResultToRoster, removeVietnameseTones, cleanName, normalizeClassRosterOrder, sortVietnameseRosterByGivenName } from '../utils/nameMatcher';
 import {
@@ -11,7 +11,8 @@ import {
   isStudentAnswerCorrect,
   encryptStudentChoice,
   decryptStudentChoice,
-  encryptSessionCache
+  encryptSessionCache,
+  verifyClassPasscode
 } from '../utils/security';
 
 const STUDENT_PROFILE_STORAGE_KEY = 'quiz_student_profile_v1';
@@ -123,11 +124,13 @@ function matchCanonicalChapter(chStr?: string | null): string | null {
 export default function Quiz({ 
   onBack, 
   isQuickPractice = false,
-  quickPracticeChapter = 'all'
+  quickPracticeChapter = 'all',
+  quickPracticeClass = '9A8'
 }: { 
   onBack?: () => void; 
   isQuickPractice?: boolean;
   quickPracticeChapter?: string;
+  quickPracticeClass?: string;
 }) {
   const [questions, setQuestions] = useState<Question[]>([]);
   const [currentStep, setCurrentStep] = useState<'info' | 'select_chapter' | 'doing' | 'result' | 'review'>('info');
@@ -168,6 +171,25 @@ export default function Quiz({
   const [loadingQuestions, setLoadingQuestions] = useState(false);
   const [selectedPart, setSelectedPart] = useState<string>('');
   const [selectedChapDropdown, setSelectedChapDropdown] = useState<string>('');
+  const [classPasscodeInput, setClassPasscodeInput] = useState<string>('');
+  const [classPasscodeSeals, setClassPasscodeSeals] = useState<Record<string, string> | null>(null);
+  const [showQuickRetryPasscodeModal, setShowQuickRetryPasscodeModal] = useState<boolean>(false);
+  const [quickRetryPasscodeInput, setQuickRetryPasscodeInput] = useState<string>('');
+  const [quickRetryError, setQuickRetryError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    getDoc(doc(db, 'metadata', 'class_passcodes'))
+      .then(snap => {
+        if (mounted && snap.exists()) {
+          setClassPasscodeSeals(snap.data()?.seals || null);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // In-app notification & confirmation modal (replaces browser alert/confirm)
   const [notice, setNotice] = useState<{ type: 'error' | 'info'; message: string } | null>(null);
@@ -788,7 +810,7 @@ export default function Quiz({
     if (isQuickPractice) {
       setStudentInfo({
         name: 'Học sinh Tự luyện',
-        class: '9',
+        class: quickPracticeClass || '9A8',
         school: 'Luyện tập nhanh'
       });
       setSelectedChapter(quickPracticeChapter && quickPracticeChapter !== 'all' ? quickPracticeChapter : 'Tự luyện ngẫu nhiên (16 câu)');
@@ -803,7 +825,7 @@ export default function Quiz({
       };
       startPractice();
     }
-  }, [isQuickPractice, quickPracticeChapter]);
+  }, [isQuickPractice, quickPracticeChapter, quickPracticeClass]);
 
   const startQuiz = async (chap?: string) => {
     const cleanedInputName = cleanName(studentInfo.name);
@@ -1333,6 +1355,22 @@ export default function Quiz({
             </AnimatePresence>
           </div>
 
+          {/* Mã bảo mật lớp (9A8, 9A9, Học thêm) */}
+          <div>
+            <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1 flex items-center gap-1">
+              <KeyRound size={12} className="text-blue-500" />
+              <span>Mã bảo mật lớp {studentInfo.class}</span>
+            </label>
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={classPasscodeInput}
+              onChange={e => setClassPasscodeInput(e.target.value)}
+              placeholder=""
+              className="w-full p-2.5 md:p-3.5 bg-slate-50 border border-slate-200 rounded-lg md:rounded-xl outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all text-sm md:text-base font-bold"
+            />
+          </div>
+
           <div className="border-t border-slate-100 pt-3 md:pt-4">
             <label className="block text-[9px] md:text-xs font-black text-slate-400 uppercase tracking-widest mb-1 ml-1">Bước 1: Chọn phân môn / kiểu đề</label>
             <div className="relative">
@@ -1398,11 +1436,32 @@ export default function Quiz({
           )}
 
           <button 
-            onClick={() => {
+            onClick={async () => {
               if (!cleanName(studentInfo.name) || !studentInfo.class || !studentInfo.school) {
                 showToast('Vui lòng nhập đầy đủ thông tin học sinh!');
                 return;
               }
+              if (!classPasscodeInput.trim()) {
+                showToast(`Vui lòng nhập Mã bảo mật của lớp ${studentInfo.class} để vào thi!`);
+                return;
+              }
+
+              let currentSeals = classPasscodeSeals;
+              if (!currentSeals) {
+                try {
+                  const snap = await getDoc(doc(db, 'metadata', 'class_passcodes'));
+                  if (snap.exists()) {
+                    currentSeals = snap.data()?.seals || null;
+                    setClassPasscodeSeals(currentSeals);
+                  }
+                } catch (e) {}
+              }
+
+              if (!verifyClassPasscode(studentInfo.class, classPasscodeInput, currentSeals)) {
+                showToast(`Mã bảo mật lớp ${studentInfo.class} không đúng! Vui lòng kiểm tra lại hoặc hỏi giáo viên bộ môn.`);
+                return;
+              }
+
               if (!selectedPart) {
                 showToast('Vui lòng chọn phân môn / kiểu đề thi!');
                 return;
@@ -1411,7 +1470,10 @@ export default function Quiz({
                 showToast('Vui lòng chọn chương học tương ứng!');
                 return;
               }
-              
+
+              // Clear passcode input so every new exam attempt requires re-entering the security code
+              setClassPasscodeInput('');
+
               // Enter Fullscreen immediately on user click gesture
               requestExamFullscreen();
 
@@ -1897,7 +1959,13 @@ export default function Quiz({
             Xem lại bài
           </button>
           <button 
-            onClick={async () => {
+            onClick={() => {
+              if (isQuickPractice) {
+                setQuickRetryPasscodeInput('');
+                setQuickRetryError(null);
+                setShowQuickRetryPasscodeModal(true);
+                return;
+              }
               sessionStorage.removeItem('quiz_current_questions_session');
               setEncryptedChoices({});
               setCurrentIndex(0);
@@ -1908,17 +1976,8 @@ export default function Quiz({
               setShowTabWarningModal(false);
               setAutoSubmittedByViolation(false);
               setQuestions([]);
-              if (isQuickPractice) {
-                setLoadingQuestions(true);
-                const success = await fetchAndRandomize(quickPracticeChapter, true);
-                if (success) {
-                  setStartTime(new Date());
-                  setCurrentStep('doing');
-                }
-              } else {
-                // Keep studentInfo (school, class, name) intact so the student doesn't have to re-type!
-                setCurrentStep('info');
-              }
+              setClassPasscodeInput('');
+              setCurrentStep('info');
             }}
             className="px-4 py-3 md:py-4 bg-slate-900 text-white rounded-lg md:rounded-xl font-black text-[10px] md:text-xs hover:bg-slate-800 transition shadow-lg shadow-slate-100 uppercase tracking-wider cursor-pointer"
           >
@@ -1931,6 +1990,100 @@ export default function Quiz({
             Trang chủ
           </button>
         </div>
+
+        {/* Modal xác nhận Mã bảo mật lớp khi làm đề mới trong Luyện Tập Nhanh */}
+        {showQuickRetryPasscodeModal && (
+          <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+            <div className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-sm w-full p-6 text-left space-y-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
+                  <KeyRound size={20} />
+                </div>
+                <div>
+                  <h4 className="text-sm font-black text-slate-900">Xác nhận Mã bảo mật lớp {studentInfo.class}</h4>
+                  <p className="text-[11px] text-slate-500 font-medium">Nhập lại mã bảo mật lớp để bắt đầu đề luyện tập mới</p>
+                </div>
+              </div>
+
+              {quickRetryError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-xs font-bold text-rose-700 flex items-center gap-1.5">
+                  <AlertCircle size={14} className="shrink-0 text-rose-600" />
+                  <span>{quickRetryError}</span>
+                </div>
+              )}
+
+              <div>
+                <input
+                  type="password"
+                  autoFocus
+                  value={quickRetryPasscodeInput}
+                  onChange={e => {
+                    setQuickRetryPasscodeInput(e.target.value);
+                    setQuickRetryError(null);
+                  }}
+                  placeholder={`Nhập mã bảo mật lớp ${studentInfo.class}...`}
+                  className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-amber-500 focus:bg-white text-sm font-bold text-slate-800"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowQuickRetryPasscodeModal(false)}
+                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-500 hover:bg-slate-100 transition cursor-pointer"
+                >
+                  Hủy
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!quickRetryPasscodeInput.trim()) {
+                      setQuickRetryError(`Vui lòng nhập Mã bảo mật của lớp ${studentInfo.class}!`);
+                      return;
+                    }
+                    let currentSeals = classPasscodeSeals;
+                    if (!currentSeals) {
+                      try {
+                        const snap = await getDoc(doc(db, 'metadata', 'class_passcodes'));
+                        if (snap.exists()) {
+                          currentSeals = snap.data()?.seals || null;
+                          setClassPasscodeSeals(currentSeals);
+                        }
+                      } catch (e) {}
+                    }
+                    if (!verifyClassPasscode(studentInfo.class, quickRetryPasscodeInput, currentSeals)) {
+                      setQuickRetryError(`Mã bảo mật lớp ${studentInfo.class} không đúng!`);
+                      return;
+                    }
+
+                    setShowQuickRetryPasscodeModal(false);
+                    setQuickRetryPasscodeInput('');
+                    requestExamFullscreen();
+                    sessionStorage.removeItem('quiz_current_questions_session');
+                    setEncryptedChoices({});
+                    setCurrentIndex(0);
+                    setScore(0);
+                    setCorrectCount(0);
+                    setElapsedSeconds(0);
+                    setTabSwitchCount(0);
+                    setShowTabWarningModal(false);
+                    setAutoSubmittedByViolation(false);
+                    setQuestions([]);
+                    setLoadingQuestions(true);
+                    const success = await fetchAndRandomize(quickPracticeChapter, true);
+                    if (success) {
+                      setStartTime(new Date());
+                      setCurrentStep('doing');
+                    }
+                  }}
+                  className="px-5 py-2 rounded-xl text-xs font-black bg-amber-500 text-white hover:bg-amber-600 shadow-lg shadow-amber-100 transition cursor-pointer"
+                >
+                  Vào luyện ngay
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

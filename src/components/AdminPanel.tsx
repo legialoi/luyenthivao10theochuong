@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { db, Question, QuizResult, handleFirestoreError, OperationType, PART_CHAPTERS, SCHOOL_CLASSES } from '../lib/firebase';
 import { collection, addDoc, getDocs, query, deleteDoc, doc, Timestamp, orderBy, writeBatch, updateDoc, setDoc, getDoc, limit, where } from 'firebase/firestore';
-import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2, AlertTriangle, Users, ShieldCheck } from 'lucide-react';
+import { Trash2, Plus, RefreshCw, LogOut, FileText, BarChart2, Settings, FileJson, FileCode, FileType, Download, Edit2, AlertTriangle, Users, ShieldCheck, KeyRound, Save } from 'lucide-react';
 import MathText from './MathText';
 import * as XLSX from 'xlsx';
 import { parseWordToQuiz, ParsedQuestion } from '../utils/wordParser';
@@ -9,7 +9,7 @@ import QuizPreview from './QuizPreview';
 import { solveQuestion } from '../services/geminiService';
 import StudentWeeklyStatsModal from './StudentWeeklyStatsModal';
 import MathEquationToolbar from './MathEquationToolbar';
-import { hydrateQuestionForAdmin, prepareQuestionForFirestore } from '../utils/security';
+import { hydrateQuestionForAdmin, prepareQuestionForFirestore, sealClassPasscode, unsealClassPasscodeForAdmin, getDefaultClassPasscodeSeals } from '../utils/security';
 
 export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<'questions' | 'stats'>('questions');
@@ -41,10 +41,63 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
   const [showWeeklyStatsModal, setShowWeeklyStatsModal] = useState(false);
   const hasChanges = pendingDeletes.length > 0 || pendingUpdates.length > 0;
   const [metadata, setMetadata] = useState<any>(null);
+  const [classCodes, setClassCodes] = useState<Record<string, string>>({
+    '9A8': unsealClassPasscodeForAdmin('9A8'),
+    '9A9': unsealClassPasscodeForAdmin('9A9'),
+    'Học thêm': unsealClassPasscodeForAdmin('Học thêm')
+  });
+  const [savingClassCodes, setSavingClassCodes] = useState(false);
 
   useEffect(() => {
     fetchMetadataAndResults();
+    fetchClassPasscodes();
   }, []);
+
+  const fetchClassPasscodes = async () => {
+    try {
+      const snap = await getDoc(doc(db, 'metadata', 'class_passcodes'));
+      if (snap.exists() && snap.data()?.seals) {
+        const seals = snap.data().seals;
+        setClassCodes({
+          '9A8': unsealClassPasscodeForAdmin('9A8', seals['9A8']),
+          '9A9': unsealClassPasscodeForAdmin('9A9', seals['9A9']),
+          'Học thêm': unsealClassPasscodeForAdmin('Học thêm', seals['Học thêm'])
+        });
+      } else {
+        const defaultSeals = getDefaultClassPasscodeSeals();
+        await setDoc(doc(db, 'metadata', 'class_passcodes'), {
+          seals: defaultSeals,
+          updatedAt: Timestamp.now()
+        });
+      }
+    } catch (e) {
+      console.error('Error loading class passcodes:', e);
+    }
+  };
+
+  const handleSaveClassPasscodes = async () => {
+    if (!classCodes['9A8']?.trim() || !classCodes['9A9']?.trim()) {
+      alert('Mã bảo mật của lớp 9A8 và 9A9 không được để trống!');
+      return;
+    }
+    setSavingClassCodes(true);
+    try {
+      const seals = {
+        '9A8': sealClassPasscode('9A8', classCodes['9A8'].trim()),
+        '9A9': sealClassPasscode('9A9', classCodes['9A9'].trim()),
+        'Học thêm': sealClassPasscode('Học thêm', (classCodes['Học thêm'] || 'HT2026').trim())
+      };
+      await setDoc(doc(db, 'metadata', 'class_passcodes'), {
+        seals,
+        updatedAt: Timestamp.now()
+      });
+      alert('Đã lưu và mã hóa Mã bảo mật cho các lớp thành công!');
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, 'metadata/class_passcodes');
+    } finally {
+      setSavingClassCodes(false);
+    }
+  };
 
   useEffect(() => {
     if (filterCategory === 'Tất cả' && filterChapter === 'Tất cả') {
@@ -1062,6 +1115,49 @@ export default function AdminPanel({ onLogout }: { onLogout: () => void }) {
         </header>
 
         <div className="flex-1 overflow-y-auto p-2">
+            {/* Thanh cấu hình Mã Bảo Mật Lớp (9A8, 9A9, Học thêm) */}
+            <div className="mb-2 bg-white p-2.5 rounded-xl border border-amber-200 shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-2">
+              <div className="flex items-center gap-2 shrink-0">
+                <div className="w-7 h-7 bg-amber-500 text-white rounded-lg flex items-center justify-center shadow-xs">
+                  <KeyRound size={15} />
+                </div>
+                <div>
+                  <div className="text-[11px] font-black text-slate-800 uppercase tracking-tight">
+                    Mã bảo mật vào thi theo lớp (Đã mã hóa chống F12)
+                  </div>
+                  <div className="text-[9px] text-slate-500 font-semibold">
+                    Học sinh bắt buộc phải nhập đúng mã bảo mật của lớp mình mỗi khi vào Luyện Chính Thức hoặc Luyện Nhanh
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
+                {(['9A8', '9A9', 'Học thêm'] as const).map(cls => (
+                  <div key={cls} className="flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
+                    <span className="text-[10px] font-black text-slate-500 uppercase whitespace-nowrap">
+                      {cls === 'Học thêm' ? 'Học thêm:' : `Lớp ${cls}:`}
+                    </span>
+                    <input
+                      type="text"
+                      value={classCodes[cls] || ''}
+                      onChange={e => setClassCodes(prev => ({ ...prev, [cls]: e.target.value }))}
+                      className="w-20 bg-white border border-slate-200 rounded px-2 py-0.5 text-xs font-black text-blue-700 outline-none focus:ring-2 focus:ring-amber-500 text-center"
+                      placeholder="Mã lớp..."
+                    />
+                  </div>
+                ))}
+
+                <button
+                  onClick={handleSaveClassPasscodes}
+                  disabled={savingClassCodes}
+                  className="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-black text-[10px] uppercase tracking-wider flex items-center gap-1.5 shadow-xs transition cursor-pointer shrink-0"
+                >
+                  <Save size={13} />
+                  <span>{savingClassCodes ? 'Đang lưu...' : 'Lưu mã lớp'}</span>
+                </button>
+              </div>
+            </div>
+
             {activeTab === 'questions' ? (
               <div key="q" className="space-y-2">
                 {/* Stats Cards */}
